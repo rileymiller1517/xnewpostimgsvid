@@ -19,7 +19,7 @@ on:
         required: false
         default: ""
       links:
-        description: "Optional comma-separated links — one per post, in order (leave blank to omit links)"
+        description: "Optional comma-separated links — one per post (leave blank to omit)"
         required: false
         default: ""
       interval_minutes:
@@ -31,7 +31,7 @@ on:
         required: false
         default: "false"
       image_ratio:
-        description: "Fraction of posts that should be images, e.g. 0.6 = 60% images / 40% videos"
+        description: "Fraction of posts that are images, e.g. 0.6 = 60% images / 40% videos"
         required: false
         default: "0.6"
       source_folder_id:
@@ -46,7 +46,7 @@ on:
 jobs:
   bulk-post-media:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # GitHub hard cap on hosted runners
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repo
@@ -69,20 +69,27 @@ jobs:
 
       - name: Run media poster
         env:
-          # ── Google Drive ──────────────────────────────────────────────────
-          GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
-          # Folder IDs: workflow input takes precedence, falls back to secret
-          GDRIVE_SOURCE_FOLDER_ID: ${{ github.event.inputs.source_folder_id != '' && github.event.inputs.source_folder_id || secrets.GDRIVE_SOURCE_FOLDER_ID }}
+          GDRIVE_CREDENTIALS_JSON:  ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
+          GDRIVE_SOURCE_FOLDER_ID:  ${{ github.event.inputs.source_folder_id != '' && github.event.inputs.source_folder_id || secrets.GDRIVE_SOURCE_FOLDER_ID }}
           GDRIVE_CLAIMED_FOLDER_ID: ${{ github.event.inputs.claimed_folder_id != '' && github.event.inputs.claimed_folder_id || secrets.GDRIVE_CLAIMED_FOLDER_ID }}
-          # ── Post settings ─────────────────────────────────────────────────
-          POST_COUNT: ${{ github.event.inputs.post_count }}
-          CAPTION_SOURCE: ${{ github.event.inputs.caption_source }}
-          CUSTOM_CAPTION: ${{ github.event.inputs.custom_caption }}
-          LINKS: ${{ github.event.inputs.links }}
-          INTERVAL_MINUTES: ${{ github.event.inputs.interval_minutes }}
-          SHUFFLE_ORDER: ${{ github.event.inputs.shuffle }}
-          IMAGE_RATIO: ${{ github.event.inputs.image_ratio }}
-          # ── Paths ─────────────────────────────────────────────────────────
+          POST_COUNT:        ${{ github.event.inputs.post_count }}
+          CAPTION_SOURCE:    ${{ github.event.inputs.caption_source }}
+          CUSTOM_CAPTION:    ${{ github.event.inputs.custom_caption }}
+          LINKS:             ${{ github.event.inputs.links }}
+          INTERVAL_MINUTES:  ${{ github.event.inputs.interval_minutes }}
+          SHUFFLE_ORDER:     ${{ github.event.inputs.shuffle }}
+          IMAGE_RATIO:       ${{ github.event.inputs.image_ratio }}
           X_STORAGE_STATE_PATH: x_storage_state.json
-          POSTS_CSV_PATH: table.csv
+          POSTS_CSV_PATH:    table.csv
         run: python bulk_post_media_to_x.py
+
+      # Always upload screenshots so you can download and inspect them
+      # even when the run fails
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: debug_screenshots/
+          if-no-files-found: ignore
+          retention-days: 7
