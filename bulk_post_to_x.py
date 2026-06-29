@@ -1,105 +1,243 @@
 """
-Bulk-posts a list of links to X, one every N minutes, all within a single
-GitHub Actions run.
+Bulk-posts images/videos from Google Drive to X (Twitter).
 
-Two caption modes, set via CAPTION_SOURCE:
+Media selection:
+  - Pulls files from a Google Drive folder (GDRIVE_SOURCE_FOLDER_ID).
+  - 60% images (jpg/jpeg/png/gif/webp), 40% videos (mp4/mov/avi).
+  - After a successful post, moves the file to GDRIVE_CLAIMED_FOLDER_ID
+    to prevent re-posting.
+
+Caption modes (CAPTION_SOURCE):
   - "csv":    randomly picks one row (Action Caption, Caption, Hashtags)
-              from table.csv for EACH link.
-  - "custom": uses one CUSTOM_CAPTION text for ALL links posted this run.
-              Type \n (backslash-n) in the workflow input wherever you want
-              a line break -- the GitHub UI box is single-line, so this is
-              how multi-line text gets in.
+              from table.csv for EACH post.
+  - "custom": uses CUSTOM_CAPTION for ALL posts this run.
+              Use \\n in the GitHub UI input for line breaks.
 
-Final post text is always:
+Post text format:
     {caption block}
 
-    {link}
+    {optional link if LINKS provided, else omitted}
 
-Required env vars:
-    LINKS                 - comma-separated list of links (required)
-    CAPTION_SOURCE         - "csv" or "custom" (default: csv)
-    CUSTOM_CAPTION         - used when CAPTION_SOURCE=custom
-    X_STORAGE_STATE_PATH   - path to saved session (default: x_storage_state.json)
-    POSTS_CSV_PATH         - path to caption CSV (default: table.csv)
-    INTERVAL_MINUTES       - minutes between posts (default: 10)
-    SHUFFLE_ORDER          - "true" to post links in random order (default: false)
+Required GitHub Secrets → env vars:
+    GDRIVE_CREDENTIALS_JSON   - full token JSON (as a secret string)
+    X_STORAGE_STATE_JSON      - Playwright session JSON
+
+Optional env vars:
+    GDRIVE_SOURCE_FOLDER_ID   - Drive folder to pick media from
+    GDRIVE_CLAIMED_FOLDER_ID  - Drive folder to move posted files into
+    POST_COUNT                - how many posts this run (default: 5)
+    LINKS                     - optional comma-separated links, one per post
+    CAPTION_SOURCE            - "csv" or "custom" (default: csv)
+    CUSTOM_CAPTION            - used when CAPTION_SOURCE=custom
+    X_STORAGE_STATE_PATH      - path to saved session (default: x_storage_state.json)
+    POSTS_CSV_PATH            - path to caption CSV (default: table.csv)
+    INTERVAL_MINUTES          - minutes between posts (default: 10)
+    SHUFFLE_ORDER              - "true" to shuffle media order (default: false)
+    IMAGE_RATIO               - fraction of posts that are images (default: 0.6)
 """
 
 import csv
+import json
 import os
 import random
 import sys
+import tempfile
 import time
+from pathlib import Path
+
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-LINKS_RAW = os.environ.get("LINKS", "")
-CAPTION_SOURCE = os.environ.get("CAPTION_SOURCE", "csv").strip().lower()
-CUSTOM_CAPTION_RAW = os.environ.get("CUSTOM_CAPTION", "")
-STORAGE_STATE_PATH = os.environ.get("X_STORAGE_STATE_PATH", "x_storage_state.json")
-CSV_PATH = os.environ.get("POSTS_CSV_PATH", "table.csv")
-INTERVAL_MINUTES = float(os.environ.get("INTERVAL_MINUTES", "10"))
-INTERVAL_SECONDS = int(INTERVAL_MINUTES * 60)
-SHUFFLE = os.environ.get("SHUFFLE_ORDER", "false").lower() == "true"
+# ── Config ────────────────────────────────────────────────────────────────────
+GDRIVE_CREDS_JSON     = os.environ.get("GDRIVE_CREDENTIALS_JSON", "")
+SOURCE_FOLDER_ID      = os.environ.get("GDRIVE_SOURCE_FOLDER_ID", "")
+CLAIMED_FOLDER_ID     = os.environ.get("GDRIVE_CLAIMED_FOLDER_ID", "")
+POST_COUNT            = int(os.environ.get("POST_COUNT", "5"))
+LINKS_RAW             = os.environ.get("LINKS", "")
+CAPTION_SOURCE        = os.environ.get("CAPTION_SOURCE", "csv").strip().lower()
+CUSTOM_CAPTION_RAW    = os.environ.get("CUSTOM_CAPTION", "")
+STORAGE_STATE_PATH    = os.environ.get("X_STORAGE_STATE_PATH", "x_storage_state.json")
+CSV_PATH              = os.environ.get("POSTS_CSV_PATH", "table.csv")
+INTERVAL_MINUTES      = float(os.environ.get("INTERVAL_MINUTES", "10"))
+INTERVAL_SECONDS      = int(INTERVAL_MINUTES * 60)
+SHUFFLE               = os.environ.get("SHUFFLE_ORDER", "false").lower() == "true"
+IMAGE_RATIO           = float(os.environ.get("IMAGE_RATIO", "0.6"))
+
+IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+VIDEO_MIMES = {"video/mp4", "video/quicktime", "video/x-msvideo", "video/mpeg"}
+
+# ── Google Drive helpers ──────────────────────────────────────────────────────
+
+def build_drive_service():
+    if not GDRIVE_CREDS_JSON.strip():
+        sys.exit("GDRIVE_CREDENTIALS_JSON secret is empty.")
+    creds_data = json.loads(GDRIVE_CREDS_JSON)
+    creds = Credentials(
+        token=creds_data.get("token"),
+        refresh_token=creds_data.get("refresh_token"),
+        token_uri=creds_data.get("token_uri", "https://oauth2.googleapis.com/token"),
+        client_id=creds_data.get("client_id"),
+        client_secret=creds_data.get("client_secret"),
+        scopes=creds_data.get("scopes", ["https://www.googleapis.com/auth/drive"]),
+    )
+    return build("drive", "v3", credentials=creds)
 
 
-def parse_links(raw):
-    links = [l.strip() for l in raw.split(",") if l.strip()]
-    if not links:
-        sys.exit("No links provided. Set the LINKS input (comma-separated).")
-    return links
+def list_media_in_folder(service, folder_id):
+    """Return all image/video files in the given Drive folder."""
+    if not folder_id:
+        sys.exit("GDRIVE_SOURCE_FOLDER_ID is not set.")
+    query = (
+        f"'{folder_id}' in parents and trashed=false and ("
+        + " or ".join(f"mimeType='{m}'" for m in IMAGE_MIMES | VIDEO_MIMES)
+        + ")"
+    )
+    results, page_token = [], None
+    while True:
+        resp = service.files().list(
+            q=query,
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageSize=200,
+            pageToken=page_token,
+        ).execute()
+        results.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return results
 
+
+def select_media(files, count, image_ratio):
+    """Pick `count` files respecting image/video ratio."""
+    images = [f for f in files if f["mimeType"] in IMAGE_MIMES]
+    videos = [f for f in files if f["mimeType"] in VIDEO_MIMES]
+
+    if not images and not videos:
+        sys.exit("No image or video files found in source folder.")
+
+    n_images = round(count * image_ratio)
+    n_videos = count - n_images
+
+    # Clamp to what's available, redistribute if needed
+    n_images = min(n_images, len(images))
+    n_videos = min(n_videos, len(videos))
+    # If one type is exhausted, fill remaining slots with the other
+    total = n_images + n_videos
+    if total < count:
+        shortfall = count - total
+        if len(images) > n_images:
+            extra = min(shortfall, len(images) - n_images)
+            n_images += extra
+            shortfall -= extra
+        if shortfall > 0 and len(videos) > n_videos:
+            n_videos += min(shortfall, len(videos) - n_videos)
+
+    chosen = random.sample(images, n_images) + random.sample(videos, n_videos)
+    random.shuffle(chosen)
+    return chosen
+
+
+def download_file(service, file_id, dest_path):
+    request = service.files().get_media(fileId=file_id)
+    with open(dest_path, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+
+
+def move_to_claimed(service, file_id):
+    """Move file from source folder to claimed folder."""
+    if not CLAIMED_FOLDER_ID:
+        print("  GDRIVE_CLAIMED_FOLDER_ID not set — skipping move.")
+        return
+    file_meta = service.files().get(fileId=file_id, fields="parents").execute()
+    previous_parents = ",".join(file_meta.get("parents", []))
+    service.files().update(
+        fileId=file_id,
+        addParents=CLAIMED_FOLDER_ID,
+        removeParents=previous_parents,
+        fields="id, parents",
+    ).execute()
+    print(f"  Moved file {file_id} → claimed folder.")
+
+
+# ── Caption helpers ───────────────────────────────────────────────────────────
 
 def load_caption_rows(path):
     with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        rows = [r for r in reader if r.get("Caption", "").strip()]
+        rows = [r for r in csv.DictReader(f) if r.get("Caption", "").strip()]
     if not rows:
         sys.exit(f"No caption rows found in {path}")
     return rows
 
 
-def build_text_csv_mode(row, link):
-    action_caption = row["Action Caption"].strip()
-    caption = row["Caption"].strip()
-    hashtags = row["Hashtags"].strip()
-    return f"{action_caption}\n{caption}\n\n{hashtags}\n\n{link}"
+def build_text_csv(row, link=""):
+    parts = [
+        row["Action Caption"].strip(),
+        row["Caption"].strip(),
+        "",
+        row["Hashtags"].strip(),
+    ]
+    text = "\n".join(parts)
+    if link:
+        text += f"\n\n{link}"
+    return text
 
 
-def build_text_custom_mode(custom_caption, link):
-    text = custom_caption.replace("\\n", "\n").strip()
-    return f"{text}\n\n{link}"
+def build_text_custom(raw, link=""):
+    text = raw.replace("\\n", "\n").strip()
+    if link:
+        text += f"\n\n{link}"
+    return text
 
 
-def post_one(page, text):
+# ── X / Playwright posting ────────────────────────────────────────────────────
+
+def post_one(page, text, media_path, mime_type):
     page.goto("https://x.com/compose/post", wait_until="domcontentloaded")
 
     if "login" in page.url:
         raise RuntimeError(
-            "Session looks expired (redirected to login). "
-            "Re-run login_and_save_session.py locally and refresh the secret."
+            "Session expired (redirected to login). "
+            "Re-run login_and_save_session.py and refresh X_STORAGE_STATE_JSON."
         )
 
     textbox = page.get_by_test_id("tweetTextarea_0")
-    textbox.wait_for(state="visible", timeout=15000)
+    textbox.wait_for(state="visible", timeout=15_000)
     textbox.click()
     textbox.fill(text)
 
+    # Attach media
+    file_input = page.locator('input[data-testid="fileInput"]')
+    if file_input.count() == 0:
+        # Click the media button to reveal the file input
+        page.get_by_test_id("attachments").click()
+        file_input = page.locator('input[type="file"]').first
+
+    file_input.set_input_files(media_path)
+
+    # Wait for upload indicator to clear
+    is_video = mime_type in VIDEO_MIMES
+    upload_timeout = 120_000 if is_video else 40_000
     try:
-        page.wait_for_selector('[data-testid="card.wrapper"]', timeout=12000)
+        page.wait_for_selector('[data-testid="attachments"] [role="progressbar"]',
+                               state="detached", timeout=upload_timeout)
     except PWTimeout:
-        print("Warning: link preview card didn't render in time, posting anyway.")
+        print("  Warning: upload progress bar still visible — posting anyway.")
 
     post_button = page.get_by_test_id("tweetButton")
-    post_button.wait_for(state="visible", timeout=10000)
+    post_button.wait_for(state="visible", timeout=10_000)
     post_button.click()
-    page.wait_for_timeout(4000)
+    page.wait_for_timeout(5_000)
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    links = parse_links(LINKS_RAW)
-    if SHUFFLE:
-        random.shuffle(links)
-
+    # Validate caption config
     if CAPTION_SOURCE == "custom":
         if not CUSTOM_CAPTION_RAW.strip():
             sys.exit("CAPTION_SOURCE=custom but CUSTOM_CAPTION is empty.")
@@ -107,13 +245,30 @@ def main():
     elif CAPTION_SOURCE == "csv":
         caption_rows = load_caption_rows(CSV_PATH)
     else:
-        sys.exit(f"Unknown CAPTION_SOURCE '{CAPTION_SOURCE}', expected 'csv' or 'custom'.")
+        sys.exit(f"Unknown CAPTION_SOURCE '{CAPTION_SOURCE}'.")
 
-    est_minutes = (len(links) - 1) * INTERVAL_MINUTES
-    print(f"Posting {len(links)} link(s), mode={CAPTION_SOURCE}, spacing={INTERVAL_MINUTES} min.")
-    print(f"Estimated total run time: ~{est_minutes:.0f} minutes.")
-    if est_minutes > 350:
-        print("WARNING: close to/over GitHub's 6-hour job limit; run may be killed mid-batch.")
+    # Optional per-post links
+    links = [l.strip() for l in LINKS_RAW.split(",") if l.strip()]
+
+    # Build Drive service & pick media
+    print("Connecting to Google Drive…")
+    service = build_drive_service()
+    all_files = list_media_in_folder(service, SOURCE_FOLDER_ID)
+    print(f"Found {len(all_files)} media file(s) in source folder.")
+
+    chosen = select_media(all_files, POST_COUNT, IMAGE_RATIO)
+    if SHUFFLE:
+        random.shuffle(chosen)
+
+    n_images = sum(1 for f in chosen if f["mimeType"] in IMAGE_MIMES)
+    n_videos = len(chosen) - n_images
+    print(f"Selected {len(chosen)} file(s): {n_images} image(s), {n_videos} video(s).")
+    print(f"Interval: {INTERVAL_MINUTES} min  |  Caption mode: {CAPTION_SOURCE}")
+
+    est = (len(chosen) - 1) * INTERVAL_MINUTES
+    print(f"Estimated run time: ~{est:.0f} min.")
+    if est > 350:
+        print("WARNING: may exceed GitHub's 6-hour job limit.")
 
     with sync_playwright() as p:
         device = p.devices["iPhone 13"]
@@ -121,27 +276,47 @@ def main():
         context = browser.new_context(storage_state=STORAGE_STATE_PATH, **device)
         page = context.new_page()
 
-        for i, link in enumerate(links, start=1):
+        for i, media_file in enumerate(chosen, start=1):
+            link = links[i - 1] if i - 1 < len(links) else ""
+
             if CAPTION_SOURCE == "custom":
-                text = build_text_custom_mode(CUSTOM_CAPTION_RAW, link)
+                text = build_text_custom(CUSTOM_CAPTION_RAW, link)
             else:
                 row = random.choice(caption_rows)
-                text = build_text_csv_mode(row, link)
+                text = build_text_csv(row, link)
 
-            print(f"\n[{i}/{len(links)}] Posting:\n{text}\n")
+            ext = Path(media_file["name"]).suffix or (
+                ".mp4" if media_file["mimeType"] in VIDEO_MIMES else ".jpg"
+            )
+
+            print(f"\n[{i}/{len(chosen)}] {media_file['name']} ({media_file['mimeType']})")
+            print(f"  Caption preview: {text[:80].replace(chr(10),' ')}…")
+
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                tmp_path = tmp.name
+
             try:
-                post_one(page, text)
-                print(f"[{i}/{len(links)}] Done.")
-            except Exception as e:
-                print(f"[{i}/{len(links)}] FAILED: {e}")
+                print(f"  Downloading from Drive…")
+                download_file(service, media_file["id"], tmp_path)
 
-            if i < len(links):
-                print(f"Sleeping {INTERVAL_SECONDS}s before next post...")
+                print(f"  Posting to X…")
+                post_one(page, text, tmp_path, media_file["mimeType"])
+                print(f"[{i}/{len(chosen)}] Posted ✓")
+
+                move_to_claimed(service, media_file["id"])
+
+            except Exception as e:
+                print(f"[{i}/{len(chosen)}] FAILED: {e}")
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
+
+            if i < len(chosen):
+                print(f"  Sleeping {INTERVAL_SECONDS}s before next post…")
                 time.sleep(INTERVAL_SECONDS)
 
         browser.close()
 
-    print("\nAll links processed.")
+    print("\nAll posts processed.")
 
 
 if __name__ == "__main__":
