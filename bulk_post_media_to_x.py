@@ -270,6 +270,12 @@ def navigate_to_compose(page, post_index, attempt=1):
                     "Redirected to login — session expired. "
                     "Re-run login_and_save_session.py and update X_STORAGE_STATE_JSON."
                 )
+            if "graduated-access" in current:
+                raise RuntimeError(
+                    "Account redirected to graduated-access restriction page. "
+                    "This is an X account-level posting restriction, not a script bug — "
+                    "check Settings > Account > Account access in a normal browser."
+                )
             if "compose" in current or _textbox_visible(page):
                 dbg(f"  [NAV] Compose page confirmed.")
                 return True
@@ -611,77 +617,82 @@ def click_post_button(page, post_index):
             raise RuntimeError("Could not click Post button.")
 
 
-def confirm_post_sent(page, post_index):
-    """
-    Wait for signals that the post was sent.
+# ── Network-based post confirmation (replaces old DOM-guessing version) ───────
+#
+# Instead of inferring success from whether the compose box visually closes
+# (which is timing-sensitive and was causing false negatives -> retries ->
+# duplicate posts), we listen for the actual CreateTweet GraphQL response.
+# This tells us definitively whether a post was created, with no guessing,
+# and eliminates the duplicate-posting bug from the previous version.
 
-    Returns:
-        True  — post confirmed sent (compose box closed / URL changed / toast)
-        True  — post UNCERTAIN but treated as sent to prevent duplicate posting
-        False — only when we can clearly see the compose box is still open
-                AND the post button is still present (i.e. nothing was submitted)
+def post_with_network_confirmation(page, post_index, click_timeout=20_000):
     """
-    dbg("  [CONFIRM] Waiting for compose box to close…")
+    Clicks the Post button while listening for the CreateTweet network
+    response. Returns (sent: bool, tweet_id: str|None).
+
+    sent=True  -> CreateTweet API confirmed a new tweet id. Safe to mark posted.
+    sent=False -> CreateTweet errored, or no matching response was observed
+                  within the timeout. Safe to retry — nothing was created.
+    """
+    result = {"sent": None, "tweet_id": None}
+
+    def on_response(response):
+        if "CreateTweet" not in response.url:
+            return
+        try:
+            data = response.json()
+        except Exception:
+            return
+
+        if isinstance(data, dict) and data.get("errors"):
+            dbg(f"  [NET-CONFIRM] CreateTweet returned errors: {data['errors']}")
+            result["sent"] = False
+            return
+
+        try:
+            tweet_id = (
+                data["data"]["create_tweet"]["tweet_results"]["result"]["rest_id"]
+            )
+            dbg(f"  [NET-CONFIRM] CreateTweet succeeded, tweet_id={tweet_id}")
+            result["sent"] = True
+            result["tweet_id"] = tweet_id
+        except (KeyError, TypeError):
+            dbg("  [NET-CONFIRM] CreateTweet response shape unexpected — treating as unconfirmed.")
+            result["sent"] = False
+
+    page.on("response", on_response)
+    try:
+        click_post_button(page, post_index)
+        dbg("  [NET-CONFIRM] Waiting for CreateTweet network response…")
+        waited = 0
+        poll_step = 500
+        while result["sent"] is None and waited < click_timeout:
+            page.wait_for_timeout(poll_step)
+            waited += poll_step
+    finally:
+        page.remove_listener("response", on_response)
+
     screenshot(page, f"p{post_index}_after_click")
 
-    # Method 1: compose textbox disappears
-    try:
-        page.wait_for_selector('[data-testid="tweetTextarea_0"]',
-                               state="detached", timeout=20_000)
-        dbg("  [CONFIRM] ✓ Compose box closed — post confirmed!")
-        page.wait_for_timeout(3_000)
+    if result["sent"] is None:
+        dbg(f"  [NET-CONFIRM] No CreateTweet response within {click_timeout}ms — NOT sent.")
+        screenshot(page, f"p{post_index}_confirm_not_sent")
+        return False, None
+
+    if result["sent"]:
+        page.wait_for_timeout(1_500)
         screenshot(page, f"p{post_index}_final_state")
-        return True
-    except PWTimeout:
-        dbg("  [CONFIRM] Compose box still open — checking alternative signals…")
+        return True, result["tweet_id"]
 
-    # Method 2: URL changed away from /compose
-    page.wait_for_timeout(3_000)
-    current_url = page.url
-    dbg(f"  [CONFIRM] Current URL: {current_url}")
-    if "compose" not in current_url:
-        dbg("  [CONFIRM] ✓ URL changed — post likely sent.")
-        screenshot(page, f"p{post_index}_final_state")
-        return True
-
-    # Method 3: toast/notification appeared
-    try:
-        page.wait_for_selector(
-            '[data-testid="toast"], [aria-label*="sent"], [aria-label*="posted"]',
-            timeout=5_000,
-        )
-        dbg("  [CONFIRM] ✓ Toast notification appeared — post sent!")
-        screenshot(page, f"p{post_index}_final_state")
-        return True
-    except Exception:
-        pass
-
-    # Check if the compose box is STILL actively open with content
-    # Only return False (triggering a retry) if we can clearly see the form
-    # is still open AND still has the post button ready — nothing was submitted.
-    try:
-        textbox_still_open = page.locator('[data-testid="tweetTextarea_0"]').is_visible()
-        post_btn_still_there = any(
-            page.locator(sel).is_visible() for sel in POST_BUTTON_SELECTORS[:3]
-        )
-        if textbox_still_open and post_btn_still_there:
-            dbg("  [CONFIRM] ✗ Compose box clearly still open with post button — NOT sent.")
-            screenshot(page, f"p{post_index}_confirm_not_sent")
-            return False
-    except Exception as e:
-        dbg(f"  [CONFIRM] Could not check compose state: {e}")
-
-    # Default to TRUE (assume sent) when uncertain to avoid duplicate posting.
-    screenshot(page, f"p{post_index}_confirm_assumed_sent")
-    dbg("  [CONFIRM] ⚠ Could not confirm — ASSUMING post was sent to avoid duplicate. Continuing.")
-    return True
+    screenshot(page, f"p{post_index}_confirm_failed")
+    return False, None
 
 
 def post_one(page, text, media_path, mime_type, post_index, max_attempts=3):
     """
     Post one piece of media with retry on clear failure only.
-    Returns True if posted (confirmed or assumed), False if clearly failed all attempts.
-    Does NOT raise — caller decides what to do.
+    Returns True if posted (confirmed via network response), False if
+    clearly failed all attempts. Does NOT raise — caller decides what to do.
     """
     is_video = mime_type in VIDEO_MIMES
     media_type_label = "VIDEO" if is_video else "IMAGE"
@@ -701,19 +712,16 @@ def post_one(page, text, media_path, mime_type, post_index, max_attempts=3):
             attach_media_robust(page, media_path, mime_type, post_index)
             dbg(f"  [STEP 3] {media_type_label} attached successfully.")
 
-            dbg(f"  [STEP 4] Clicking Post button…")
-            click_post_button(page, post_index)
-
-            dbg(f"  [STEP 5] Confirming post sent…")
-            sent = confirm_post_sent(page, post_index)
+            dbg(f"  [STEP 4] Clicking Post button and confirming via network…")
+            sent, tweet_id = post_with_network_confirmation(page, post_index)
 
             if sent:
-                dbg(f"  Post #{post_index} SUCCESS on attempt {attempt}.")
+                dbg(f"  Post #{post_index} SUCCESS on attempt {attempt} (tweet_id={tweet_id}).")
                 return True
             else:
-                # Compose box is clearly still open — post did not go through.
-                # Safe to retry since nothing was submitted.
-                dbg(f"  Post #{post_index}: compose box still clearly open — retrying.")
+                # CreateTweet did not confirm success — nothing was created,
+                # so it's safe to retry from a fresh compose page.
+                dbg(f"  Post #{post_index}: not confirmed via network — retrying.")
                 if attempt < max_attempts:
                     dbg(f"  Waiting 5s before retry…")
                     page.wait_for_timeout(5_000)
@@ -721,6 +729,8 @@ def post_one(page, text, media_path, mime_type, post_index, max_attempts=3):
         except RuntimeError as e:
             dbg(f"  [ATTEMPT {attempt}] RuntimeError: {e}")
             if "login" in str(e).lower() or "session" in str(e).lower():
+                raise
+            if "graduated-access" in str(e).lower() or "restriction" in str(e).lower():
                 raise
             if attempt < max_attempts:
                 dbg(f"  Waiting 10s before retry…")
@@ -790,9 +800,7 @@ def main():
     if SHUFFLE:
         random.shuffle(chosen)
 
-    # ── FIX: Track which file IDs we've already claimed this run ──────────────
-    # This prevents double-claiming if somehow the same file appears twice
-    # (shouldn't happen with random.sample, but defensive programming).
+    # Track which file IDs we've already claimed this run, defensively.
     claimed_this_run: set = set()
 
     n_images = sum(1 for f in chosen if f["mimeType"] in IMAGE_MIMES)
@@ -851,7 +859,6 @@ def main():
             dbg(f"POST {i}/{len(chosen)}: {file_name} ({mime_type})")
             dbg(f"{'='*50}")
 
-            # ── Safety check: skip if already claimed this run ─────────────
             if file_id in claimed_this_run:
                 dbg(f"  ⚠ File '{file_name}' already claimed this run — skipping.")
                 results_summary.append((i, file_name, "SKIPPED_DUPLICATE"))
@@ -885,10 +892,9 @@ def main():
                     dbg(f"POST {i}/{len(chosen)}: SUCCESS ✓")
                     results_summary.append((i, file_name, "SUCCESS"))
 
-                    # ── FIX: Move to claimed IMMEDIATELY after posting ──────
-                    # Do this before sleeping or processing the next file,
-                    # so even if the script crashes mid-run the file is claimed
-                    # and won't be re-posted in the next workflow run.
+                    # Move to claimed IMMEDIATELY after a confirmed post, so
+                    # even if the script crashes mid-run the file won't be
+                    # re-posted in the next workflow run.
                     claimed_this_run.add(file_id)
                     move_to_claimed(service, file_id, file_name)
                 else:
@@ -898,9 +904,15 @@ def main():
             except RuntimeError as e:
                 dbg(f"POST {i}/{len(chosen)}: FATAL — {e}")
                 results_summary.append((i, file_name, f"FATAL: {e}"))
-                # If session expired, abort the whole run
-                if "login" in str(e).lower() or "session" in str(e).lower():
-                    dbg("Session appears expired — aborting run.")
+                # If session expired or account is restricted, abort the run —
+                # retrying will not help in either case.
+                msg = str(e).lower()
+                if "login" in msg or "session" in msg or "graduated-access" in msg or "restriction" in msg:
+                    dbg("Session expired or account restricted — aborting run.")
+                    try:
+                        screenshot(page, f"p{i}_FATAL")
+                    except Exception:
+                        pass
                     break
                 try:
                     screenshot(page, f"p{i}_FATAL")
@@ -916,7 +928,6 @@ def main():
                     pass
 
             finally:
-                # Always clean up the temp file
                 try:
                     Path(tmp_path).unlink(missing_ok=True)
                     dbg(f"  Temp file cleaned up.")
