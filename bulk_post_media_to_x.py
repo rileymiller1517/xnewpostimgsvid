@@ -137,19 +137,29 @@ def download_file(service, file_id, file_name, dest_path):
 
 
 def move_to_claimed(service, file_id, file_name):
+    """
+    Move a file from the source folder to the claimed folder.
+    This is called immediately after a post is confirmed (or assumed) sent,
+    so the same file is never picked again in future runs.
+    """
     if not CLAIMED_FOLDER_ID:
         dbg("  GDRIVE_CLAIMED_FOLDER_ID not set — skipping move to claimed folder.")
         return
     dbg(f"  Moving '{file_name}' to claimed folder ({CLAIMED_FOLDER_ID})…")
-    file_meta = service.files().get(fileId=file_id, fields="parents").execute()
-    previous_parents = ",".join(file_meta.get("parents", []))
-    service.files().update(
-        fileId=file_id,
-        addParents=CLAIMED_FOLDER_ID,
-        removeParents=previous_parents,
-        fields="id, parents",
-    ).execute()
-    dbg(f"  Moved '{file_name}' -> claimed folder OK.")
+    try:
+        file_meta = service.files().get(fileId=file_id, fields="parents").execute()
+        previous_parents = ",".join(file_meta.get("parents", []))
+        service.files().update(
+            fileId=file_id,
+            addParents=CLAIMED_FOLDER_ID,
+            removeParents=previous_parents,
+            fields="id, parents",
+        ).execute()
+        dbg(f"  ✓ Moved '{file_name}' -> claimed folder OK.")
+    except Exception as e:
+        # Log but don't crash — the post was already sent
+        dbg(f"  ⚠ WARNING: Failed to move '{file_name}' to claimed folder: {e}")
+        dbg(f"  ⚠ This file may be re-posted in a future run. Move it manually if needed.")
 
 
 # ── Caption helpers ───────────────────────────────────────────────────────────
@@ -601,8 +611,6 @@ def click_post_button(page, post_index):
             raise RuntimeError("Could not click Post button.")
 
 
-# ── FIX: confirm_post_sent now returns True for "uncertain" to prevent retries ──
-
 def confirm_post_sent(page, post_index):
     """
     Wait for signals that the post was sent.
@@ -648,25 +656,22 @@ def confirm_post_sent(page, post_index):
     except Exception:
         pass
 
-    # ── FIX: Check if the compose box is STILL actively open with content ──
-    # If we can't confirm it was sent, check if it's clearly still pending.
+    # Check if the compose box is STILL actively open with content
     # Only return False (triggering a retry) if we can clearly see the form
-    # is still open AND still has the post button ready to click — meaning
-    # nothing was submitted at all.
+    # is still open AND still has the post button ready — nothing was submitted.
     try:
         textbox_still_open = page.locator('[data-testid="tweetTextarea_0"]').is_visible()
         post_btn_still_there = any(
             page.locator(sel).is_visible() for sel in POST_BUTTON_SELECTORS[:3]
         )
         if textbox_still_open and post_btn_still_there:
-            dbg("  [CONFIRM] ✗ Compose box clearly still open with post button present — treating as NOT sent.")
+            dbg("  [CONFIRM] ✗ Compose box clearly still open with post button — NOT sent.")
             screenshot(page, f"p{post_index}_confirm_not_sent")
             return False
     except Exception as e:
         dbg(f"  [CONFIRM] Could not check compose state: {e}")
 
-    # ── FIX: Default to TRUE (assume sent) when uncertain ──
-    # It's far better to skip a post than to double-post the same content.
+    # Default to TRUE (assume sent) when uncertain to avoid duplicate posting.
     screenshot(page, f"p{post_index}_confirm_assumed_sent")
     dbg("  [CONFIRM] ⚠ Could not confirm — ASSUMING post was sent to avoid duplicate. Continuing.")
     return True
@@ -674,11 +679,9 @@ def confirm_post_sent(page, post_index):
 
 def post_one(page, text, media_path, mime_type, post_index, max_attempts=3):
     """
-    Post one piece of media.
-
-    BUG FIX: Retries are now only triggered by clear RuntimeErrors (e.g. attach
-    failed, textbox not found). An unconfirmed post is treated as sent and does
-    NOT trigger a retry, preventing the same image from being posted twice.
+    Post one piece of media with retry on clear failure only.
+    Returns True if posted (confirmed or assumed), False if clearly failed all attempts.
+    Does NOT raise — caller decides what to do.
     """
     is_video = mime_type in VIDEO_MIMES
     media_type_label = "VIDEO" if is_video else "IMAGE"
@@ -708,12 +711,12 @@ def post_one(page, text, media_path, mime_type, post_index, max_attempts=3):
                 dbg(f"  Post #{post_index} SUCCESS on attempt {attempt}.")
                 return True
             else:
-                # ── FIX: Only retry when we can clearly see the post did NOT go through ──
-                dbg(f"  Post #{post_index}: compose box still clearly open on attempt {attempt} — retrying.")
+                # Compose box is clearly still open — post did not go through.
+                # Safe to retry since nothing was submitted.
+                dbg(f"  Post #{post_index}: compose box still clearly open — retrying.")
                 if attempt < max_attempts:
                     dbg(f"  Waiting 5s before retry…")
                     page.wait_for_timeout(5_000)
-                # Don't raise here — loop will retry naturally
 
         except RuntimeError as e:
             dbg(f"  [ATTEMPT {attempt}] RuntimeError: {e}")
@@ -723,7 +726,8 @@ def post_one(page, text, media_path, mime_type, post_index, max_attempts=3):
                 dbg(f"  Waiting 10s before retry…")
                 page.wait_for_timeout(10_000)
             else:
-                raise
+                dbg(f"  All {max_attempts} attempts failed with RuntimeError.")
+                return False
         except Exception as e:
             dbg(f"  [ATTEMPT {attempt}] Unexpected error: {e}")
             try:
@@ -734,9 +738,11 @@ def post_one(page, text, media_path, mime_type, post_index, max_attempts=3):
                 dbg(f"  Waiting 10s before retry…")
                 page.wait_for_timeout(10_000)
             else:
-                raise
+                dbg(f"  All {max_attempts} attempts failed with unexpected error.")
+                return False
 
-    raise RuntimeError(f"All {max_attempts} attempts failed for post #{post_index}.")
+    dbg(f"  All {max_attempts} attempts exhausted for post #{post_index}.")
+    return False
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -784,6 +790,11 @@ def main():
     if SHUFFLE:
         random.shuffle(chosen)
 
+    # ── FIX: Track which file IDs we've already claimed this run ──────────────
+    # This prevents double-claiming if somehow the same file appears twice
+    # (shouldn't happen with random.sample, but defensive programming).
+    claimed_this_run: set = set()
+
     n_images = sum(1 for f in chosen if f["mimeType"] in IMAGE_MIMES)
     n_videos = len(chosen) - n_images
     dbg(f"Will post {len(chosen)} file(s): {n_images} image(s) + {n_videos} video(s).")
@@ -828,11 +839,23 @@ def main():
 
         dbg("Browser launched. Starting post loop…")
 
+        results_summary = []
+
         for i, media_file in enumerate(chosen, start=1):
+            file_id   = media_file["id"]
+            file_name = media_file["name"]
+            mime_type = media_file["mimeType"]
+
             dbg("")
             dbg(f"{'='*50}")
-            dbg(f"POST {i}/{len(chosen)}: {media_file['name']} ({media_file['mimeType']})")
+            dbg(f"POST {i}/{len(chosen)}: {file_name} ({mime_type})")
             dbg(f"{'='*50}")
+
+            # ── Safety check: skip if already claimed this run ─────────────
+            if file_id in claimed_this_run:
+                dbg(f"  ⚠ File '{file_name}' already claimed this run — skipping.")
+                results_summary.append((i, file_name, "SKIPPED_DUPLICATE"))
+                continue
 
             link = links[i - 1] if i - 1 < len(links) else ""
             if CAPTION_SOURCE == "custom":
@@ -845,33 +868,60 @@ def main():
             for line in text.split("\n"):
                 dbg(f"  | {line}")
 
-            ext = Path(media_file["name"]).suffix or (
-                ".mp4" if media_file["mimeType"] in VIDEO_MIMES else ".jpg"
+            ext = Path(file_name).suffix or (
+                ".mp4" if mime_type in VIDEO_MIMES else ".jpg"
             )
 
             with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
                 tmp_path = tmp.name
 
-            success = False
+            posted = False
             try:
-                download_file(service, media_file["id"], media_file["name"], tmp_path)
-                post_one(page, text, tmp_path, media_file["mimeType"], post_index=i)
-                dbg(f"POST {i}/{len(chosen)}: SUCCESS ✓")
-                success = True
+                download_file(service, file_id, file_name, tmp_path)
+
+                posted = post_one(page, text, tmp_path, mime_type, post_index=i)
+
+                if posted:
+                    dbg(f"POST {i}/{len(chosen)}: SUCCESS ✓")
+                    results_summary.append((i, file_name, "SUCCESS"))
+
+                    # ── FIX: Move to claimed IMMEDIATELY after posting ──────
+                    # Do this before sleeping or processing the next file,
+                    # so even if the script crashes mid-run the file is claimed
+                    # and won't be re-posted in the next workflow run.
+                    claimed_this_run.add(file_id)
+                    move_to_claimed(service, file_id, file_name)
+                else:
+                    dbg(f"POST {i}/{len(chosen)}: FAILED after all retries.")
+                    results_summary.append((i, file_name, "FAILED"))
+
+            except RuntimeError as e:
+                dbg(f"POST {i}/{len(chosen)}: FATAL — {e}")
+                results_summary.append((i, file_name, f"FATAL: {e}"))
+                # If session expired, abort the whole run
+                if "login" in str(e).lower() or "session" in str(e).lower():
+                    dbg("Session appears expired — aborting run.")
+                    break
+                try:
+                    screenshot(page, f"p{i}_FATAL")
+                except Exception:
+                    pass
+
             except Exception as e:
-                dbg(f"POST {i}/{len(chosen)}: FAILED — {e}")
+                dbg(f"POST {i}/{len(chosen)}: EXCEPTION — {e}")
+                results_summary.append((i, file_name, f"EXCEPTION: {e}"))
                 try:
                     screenshot(page, f"p{i}_EXCEPTION")
                 except Exception:
                     pass
-            finally:
-                Path(tmp_path).unlink(missing_ok=True)
-                dbg(f"  Temp file cleaned up.")
 
-            if success:
-                move_to_claimed(service, media_file["id"], media_file["name"])
-            else:
-                dbg(f"  Skipping move-to-claimed (post failed).")
+            finally:
+                # Always clean up the temp file
+                try:
+                    Path(tmp_path).unlink(missing_ok=True)
+                    dbg(f"  Temp file cleaned up.")
+                except Exception:
+                    pass
 
             if i < len(chosen):
                 dbg(f"Sleeping {INTERVAL_SECONDS}s ({INTERVAL_MINUTES} min) before next post…")
@@ -881,8 +931,12 @@ def main():
         browser.close()
 
     dbg("")
-    dbg("All posts processed.")
+    dbg("=" * 60)
+    dbg("Run complete. Summary:")
+    for idx, name, status in results_summary:
+        dbg(f"  Post {idx:>2}: [{status:^20}] {name}")
     dbg(f"Debug screenshots saved in: {SCREENSHOT_DIR.resolve()}")
+    dbg("=" * 60)
 
 
 if __name__ == "__main__":
