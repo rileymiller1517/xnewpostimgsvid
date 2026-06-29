@@ -181,7 +181,6 @@ def build_text_custom(raw, link=""):
 
 # ── X / Playwright posting ────────────────────────────────────────────────────
 
-# All known selectors for the tweet textbox, in priority order
 TEXTBOX_SELECTORS = [
     '[data-testid="tweetTextarea_0"]',
     '[data-testid="tweetTextarea_0EditorContainer"] div[contenteditable="true"]',
@@ -194,7 +193,6 @@ TEXTBOX_SELECTORS = [
     '[placeholder*="happening"]',
 ]
 
-# All known selectors for the post/tweet submit button
 POST_BUTTON_SELECTORS = [
     '[data-testid="tweetButton"]',
     '[data-testid="tweetButtonInline"]',
@@ -206,7 +204,6 @@ POST_BUTTON_SELECTORS = [
     '[aria-label="Tweet"]',
 ]
 
-# Selectors for media upload button (to click and reveal file input)
 MEDIA_BUTTON_SELECTORS = [
     '[data-testid="fileInput"]',
     'input[type="file"]',
@@ -217,7 +214,6 @@ MEDIA_BUTTON_SELECTORS = [
     'label[for*="file"]',
 ]
 
-# Preview selectors to confirm media attached
 PREVIEW_SELECTORS = [
     '[data-testid="attachments"] video',
     '[data-testid="videoComponent"]',
@@ -248,9 +244,9 @@ def navigate_to_compose(page, post_index, attempt=1):
     urls = [
         "https://x.com/compose/post",
         "https://twitter.com/compose/tweet",
-        "https://x.com/home",  # fallback: go home then click compose
+        "https://x.com/home",
     ]
-    for url in urls[:2]:  # try direct compose URLs first
+    for url in urls[:2]:
         dbg(f"  [NAV] Attempt {attempt}: navigating to {url}")
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=30_000)
@@ -272,7 +268,6 @@ def navigate_to_compose(page, post_index, attempt=1):
         except Exception as e:
             dbg(f"  [NAV] Navigation to {url} failed: {e}")
 
-    # Last resort: go home and click the compose button
     dbg("  [NAV] Trying home → compose button fallback…")
     try:
         page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30_000)
@@ -314,7 +309,6 @@ def type_text_robust(page, text, post_index):
 
     if textbox is None:
         screenshot(page, f"p{post_index}_type_no_textbox")
-        # Dump all contenteditable elements for diagnosis
         all_ce = page.locator('[contenteditable="true"]').all()
         dbg(f"  [TYPE] Found {len(all_ce)} contenteditable elements:")
         for el in all_ce:
@@ -324,7 +318,6 @@ def type_text_robust(page, text, post_index):
                 pass
         raise RuntimeError("Could not find tweet textbox with any known selector.")
 
-    # Method 1: click + keyboard.type
     try:
         textbox.scroll_into_view_if_needed()
         textbox.click()
@@ -336,7 +329,6 @@ def type_text_robust(page, text, post_index):
     except Exception as e:
         dbg(f"  [TYPE] keyboard.type failed: {e} — trying fill…")
 
-    # Method 2: fill (works on some contenteditable)
     try:
         textbox.fill(text)
         page.wait_for_timeout(500)
@@ -345,7 +337,6 @@ def type_text_robust(page, text, post_index):
     except Exception as e:
         dbg(f"  [TYPE] fill failed: {e} — trying JS innerText…")
 
-    # Method 3: JS injection
     try:
         page.evaluate(
             """(args) => {
@@ -372,7 +363,6 @@ def attach_media_robust(page, media_path, mime_type, post_index):
     is_video = mime_type in VIDEO_MIMES
     upload_timeout = 120_000 if is_video else 45_000
 
-    # ── Strategy A: set_input_files on hidden file input ─────────────────────
     dbg("  [ATTACH-A] Looking for file input directly…")
     file_inputs = page.locator('input[type="file"]')
     count = file_inputs.count()
@@ -383,7 +373,6 @@ def attach_media_robust(page, media_path, mime_type, post_index):
             inp = file_inputs.nth(idx)
             accept = inp.get_attribute("accept") or ""
             dbg(f"  [ATTACH-A] Input #{idx}: accept='{accept}'")
-            # Pick input that accepts images/videos
             if (is_video and ("video" in accept or accept == "")) or \
                (not is_video and ("image" in accept or accept == "")):
                 try:
@@ -394,7 +383,6 @@ def attach_media_robust(page, media_path, mime_type, post_index):
                 except Exception as e:
                     dbg(f"  [ATTACH-A] set_input_files #{idx} failed: {e}")
 
-        # Try all inputs if targeted one failed
         for idx in range(count):
             try:
                 file_inputs.nth(idx).set_input_files(media_path)
@@ -404,7 +392,6 @@ def attach_media_robust(page, media_path, mime_type, post_index):
             except Exception as e:
                 dbg(f"  [ATTACH-A] Fallback #{idx} failed: {e}")
 
-    # ── Strategy B: click media toolbar button, then set_input_files ─────────
     dbg("  [ATTACH-B] Clicking media toolbar button to reveal file input…")
     media_btn_selectors = [
         '[data-testid="addMedia"]',
@@ -421,7 +408,6 @@ def attach_media_robust(page, media_path, mime_type, post_index):
                 btn.click()
                 page.wait_for_timeout(1_000)
                 dbg(f"  [ATTACH-B] Clicked button: {btn_sel}")
-                # After clicking, try file inputs again
                 file_inputs2 = page.locator('input[type="file"]')
                 if file_inputs2.count() > 0:
                     file_inputs2.first.set_input_files(media_path)
@@ -431,7 +417,6 @@ def attach_media_robust(page, media_path, mime_type, post_index):
         except Exception as e:
             dbg(f"  [ATTACH-B] Button {btn_sel} failed: {e}")
 
-    # ── Strategy C: dispatch file via JS FileList ─────────────────────────────
     dbg("  [ATTACH-C] Trying JS FileList dispatch…")
     try:
         with open(media_path, "rb") as f:
@@ -473,7 +458,6 @@ def attach_media_robust(page, media_path, mime_type, post_index):
     except Exception as e:
         dbg(f"  [ATTACH-C] JS FileList failed: {e}")
 
-    # ── Strategy D: drag-and-drop simulation ─────────────────────────────────
     dbg("  [ATTACH-D] Trying drag-and-drop simulation…")
     try:
         with open(media_path, "rb") as f:
@@ -534,7 +518,6 @@ def _wait_for_preview(page, timeout, post_index, strategy_label):
         try:
             page.wait_for_selector(sel, timeout=timeout // len(PREVIEW_SELECTORS))
             dbg(f"  [PREVIEW-{strategy_label}] Preview appeared: {sel}")
-            # If progress bar, wait for it to finish
             _wait_for_upload_finish(page, timeout)
             page.wait_for_timeout(1_500)
             screenshot(page, f"p{post_index}_preview_{strategy_label}")
@@ -542,7 +525,6 @@ def _wait_for_preview(page, timeout, post_index, strategy_label):
         except Exception:
             pass
 
-    # Final check: just wait a bit and see if attachments area appears
     page.wait_for_timeout(3_000)
     attach = page.locator('[data-testid="attachments"]')
     if attach.count() > 0:
@@ -575,7 +557,6 @@ def click_post_button(page, post_index):
 
     if post_btn is None:
         screenshot(page, f"p{post_index}_no_post_button")
-        # Dump all buttons
         all_btns = page.locator("button").all()
         dbg(f"  [POST-BTN] All buttons ({len(all_btns)}):")
         for b in all_btns[:20]:
@@ -598,7 +579,6 @@ def click_post_button(page, post_index):
             if not is_disabled:
                 break
 
-    # Click with fallback methods
     try:
         post_btn.click()
         dbg("  [POST-BTN] Clicked via .click().")
@@ -621,8 +601,18 @@ def click_post_button(page, post_index):
             raise RuntimeError("Could not click Post button.")
 
 
+# ── FIX: confirm_post_sent now returns True for "uncertain" to prevent retries ──
+
 def confirm_post_sent(page, post_index):
-    """Wait for compose box to close or URL to change — confirms post was sent."""
+    """
+    Wait for signals that the post was sent.
+
+    Returns:
+        True  — post confirmed sent (compose box closed / URL changed / toast)
+        True  — post UNCERTAIN but treated as sent to prevent duplicate posting
+        False — only when we can clearly see the compose box is still open
+                AND the post button is still present (i.e. nothing was submitted)
+    """
     dbg("  [CONFIRM] Waiting for compose box to close…")
     screenshot(page, f"p{post_index}_after_click")
 
@@ -658,52 +648,77 @@ def confirm_post_sent(page, post_index):
     except Exception:
         pass
 
-    screenshot(page, f"p{post_index}_confirm_uncertain")
-    dbg("  [CONFIRM] ⚠ Could not confirm post was sent — marking uncertain.")
-    return False
+    # ── FIX: Check if the compose box is STILL actively open with content ──
+    # If we can't confirm it was sent, check if it's clearly still pending.
+    # Only return False (triggering a retry) if we can clearly see the form
+    # is still open AND still has the post button ready to click — meaning
+    # nothing was submitted at all.
+    try:
+        textbox_still_open = page.locator('[data-testid="tweetTextarea_0"]').is_visible()
+        post_btn_still_there = any(
+            page.locator(sel).is_visible() for sel in POST_BUTTON_SELECTORS[:3]
+        )
+        if textbox_still_open and post_btn_still_there:
+            dbg("  [CONFIRM] ✗ Compose box clearly still open with post button present — treating as NOT sent.")
+            screenshot(page, f"p{post_index}_confirm_not_sent")
+            return False
+    except Exception as e:
+        dbg(f"  [CONFIRM] Could not check compose state: {e}")
+
+    # ── FIX: Default to TRUE (assume sent) when uncertain ──
+    # It's far better to skip a post than to double-post the same content.
+    screenshot(page, f"p{post_index}_confirm_assumed_sent")
+    dbg("  [CONFIRM] ⚠ Could not confirm — ASSUMING post was sent to avoid duplicate. Continuing.")
+    return True
 
 
 def post_one(page, text, media_path, mime_type, post_index, max_attempts=3):
-    """Post one piece of media with full retry logic."""
+    """
+    Post one piece of media.
+
+    BUG FIX: Retries are now only triggered by clear RuntimeErrors (e.g. attach
+    failed, textbox not found). An unconfirmed post is treated as sent and does
+    NOT trigger a retry, preventing the same image from being posted twice.
+    """
     is_video = mime_type in VIDEO_MIMES
     media_type_label = "VIDEO" if is_video else "IMAGE"
 
     for attempt in range(1, max_attempts + 1):
         dbg(f"  ─── Post attempt {attempt}/{max_attempts} ───")
         try:
-            # ── 1. Navigate ───────────────────────────────────────────────────
             dbg(f"  [STEP 1] Navigating to compose page…")
             navigate_to_compose(page, post_index, attempt)
 
-            # ── 2. Type caption ───────────────────────────────────────────────
             dbg(f"  [STEP 2] Typing caption…")
             type_text_robust(page, text, post_index)
             screenshot(page, f"p{post_index}_a{attempt}_caption_typed")
             dbg(f"  [STEP 2] Caption typed ({len(text)} chars).")
 
-            # ── 3. Attach media ───────────────────────────────────────────────
             dbg(f"  [STEP 3] Attaching {media_type_label}: {media_path}")
             attach_media_robust(page, media_path, mime_type, post_index)
             dbg(f"  [STEP 3] {media_type_label} attached successfully.")
 
-            # ── 4. Click Post ─────────────────────────────────────────────────
             dbg(f"  [STEP 4] Clicking Post button…")
             click_post_button(page, post_index)
 
-            # ── 5. Confirm ────────────────────────────────────────────────────
             dbg(f"  [STEP 5] Confirming post sent…")
             sent = confirm_post_sent(page, post_index)
+
             if sent:
                 dbg(f"  Post #{post_index} SUCCESS on attempt {attempt}.")
                 return True
             else:
-                dbg(f"  Post #{post_index} unconfirmed on attempt {attempt} — retrying.")
-                page.wait_for_timeout(5_000)
+                # ── FIX: Only retry when we can clearly see the post did NOT go through ──
+                dbg(f"  Post #{post_index}: compose box still clearly open on attempt {attempt} — retrying.")
+                if attempt < max_attempts:
+                    dbg(f"  Waiting 5s before retry…")
+                    page.wait_for_timeout(5_000)
+                # Don't raise here — loop will retry naturally
 
         except RuntimeError as e:
             dbg(f"  [ATTEMPT {attempt}] RuntimeError: {e}")
             if "login" in str(e).lower() or "session" in str(e).lower():
-                raise  # don't retry auth failures
+                raise
             if attempt < max_attempts:
                 dbg(f"  Waiting 10s before retry…")
                 page.wait_for_timeout(10_000)
@@ -798,11 +813,9 @@ def main():
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-            # Accept all permissions that X might request
             permissions=["notifications"],
         )
 
-        # Remove automation fingerprints
         context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
@@ -810,7 +823,6 @@ def main():
 
         page = context.new_page()
 
-        # Log browser events
         page.on("console", lambda msg: dbg(f"  [BROWSER {msg.type.upper()}] {msg.text[:200]}"))
         page.on("requestfailed", lambda req: dbg(f"  [NET FAIL] {req.url[:100]}"))
 
