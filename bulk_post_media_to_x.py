@@ -18,7 +18,7 @@ Post text format:
 
     {optional link if LINKS provided, else omitted}
 
-Required GitHub Secrets → env vars:
+Required GitHub Secrets -> env vars:
     GDRIVE_CREDENTIALS_JSON   - full token JSON (as a secret string)
     X_STORAGE_STATE_JSON      - Playwright session JSON
 
@@ -32,7 +32,7 @@ Optional env vars:
     X_STORAGE_STATE_PATH      - path to saved session (default: x_storage_state.json)
     POSTS_CSV_PATH            - path to caption CSV (default: table.csv)
     INTERVAL_MINUTES          - minutes between posts (default: 10)
-    SHUFFLE_ORDER              - "true" to shuffle media order (default: false)
+    SHUFFLE_ORDER             - "true" to shuffle media order (default: false)
     IMAGE_RATIO               - fraction of posts that are images (default: 0.6)
 """
 
@@ -47,23 +47,23 @@ from pathlib import Path
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.http import MediaIoBaseDownload
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ── Config ────────────────────────────────────────────────────────────────────
-GDRIVE_CREDS_JSON     = os.environ.get("GDRIVE_CREDENTIALS_JSON", "")
-SOURCE_FOLDER_ID      = os.environ.get("GDRIVE_SOURCE_FOLDER_ID", "")
-CLAIMED_FOLDER_ID     = os.environ.get("GDRIVE_CLAIMED_FOLDER_ID", "")
-POST_COUNT            = int(os.environ.get("POST_COUNT", "5"))
-LINKS_RAW             = os.environ.get("LINKS", "")
-CAPTION_SOURCE        = os.environ.get("CAPTION_SOURCE", "csv").strip().lower()
-CUSTOM_CAPTION_RAW    = os.environ.get("CUSTOM_CAPTION", "")
-STORAGE_STATE_PATH    = os.environ.get("X_STORAGE_STATE_PATH", "x_storage_state.json")
-CSV_PATH              = os.environ.get("POSTS_CSV_PATH", "table.csv")
-INTERVAL_MINUTES      = float(os.environ.get("INTERVAL_MINUTES", "10"))
-INTERVAL_SECONDS      = int(INTERVAL_MINUTES * 60)
-SHUFFLE               = os.environ.get("SHUFFLE_ORDER", "false").lower() == "true"
-IMAGE_RATIO           = float(os.environ.get("IMAGE_RATIO", "0.6"))
+GDRIVE_CREDS_JSON  = os.environ.get("GDRIVE_CREDENTIALS_JSON", "")
+SOURCE_FOLDER_ID   = os.environ.get("GDRIVE_SOURCE_FOLDER_ID", "")
+CLAIMED_FOLDER_ID  = os.environ.get("GDRIVE_CLAIMED_FOLDER_ID", "")
+POST_COUNT         = int(os.environ.get("POST_COUNT", "5"))
+LINKS_RAW          = os.environ.get("LINKS", "")
+CAPTION_SOURCE     = os.environ.get("CAPTION_SOURCE", "csv").strip().lower()
+CUSTOM_CAPTION_RAW = os.environ.get("CUSTOM_CAPTION", "")
+STORAGE_STATE_PATH = os.environ.get("X_STORAGE_STATE_PATH", "x_storage_state.json")
+CSV_PATH           = os.environ.get("POSTS_CSV_PATH", "table.csv")
+INTERVAL_MINUTES   = float(os.environ.get("INTERVAL_MINUTES", "10"))
+INTERVAL_SECONDS   = int(INTERVAL_MINUTES * 60)
+SHUFFLE            = os.environ.get("SHUFFLE_ORDER", "false").lower() == "true"
+IMAGE_RATIO        = float(os.environ.get("IMAGE_RATIO", "0.6"))
 
 IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 VIDEO_MIMES = {"video/mp4", "video/quicktime", "video/x-msvideo", "video/mpeg"}
@@ -86,7 +86,6 @@ def build_drive_service():
 
 
 def list_media_in_folder(service, folder_id):
-    """Return all image/video files in the given Drive folder."""
     if not folder_id:
         sys.exit("GDRIVE_SOURCE_FOLDER_ID is not set.")
     query = (
@@ -110,30 +109,22 @@ def list_media_in_folder(service, folder_id):
 
 
 def select_media(files, count, image_ratio):
-    """Pick `count` files respecting image/video ratio."""
     images = [f for f in files if f["mimeType"] in IMAGE_MIMES]
     videos = [f for f in files if f["mimeType"] in VIDEO_MIMES]
-
     if not images and not videos:
         sys.exit("No image or video files found in source folder.")
-
     n_images = round(count * image_ratio)
     n_videos = count - n_images
-
-    # Clamp to what's available, redistribute if needed
     n_images = min(n_images, len(images))
     n_videos = min(n_videos, len(videos))
-    # If one type is exhausted, fill remaining slots with the other
     total = n_images + n_videos
     if total < count:
         shortfall = count - total
-        if len(images) > n_images:
-            extra = min(shortfall, len(images) - n_images)
-            n_images += extra
-            shortfall -= extra
-        if shortfall > 0 and len(videos) > n_videos:
+        extra = min(shortfall, len(images) - n_images)
+        n_images += extra
+        shortfall -= extra
+        if shortfall > 0:
             n_videos += min(shortfall, len(videos) - n_videos)
-
     chosen = random.sample(images, n_images) + random.sample(videos, n_videos)
     random.shuffle(chosen)
     return chosen
@@ -145,11 +136,12 @@ def download_file(service, file_id, dest_path):
         downloader = MediaIoBaseDownload(fh, request)
         done = False
         while not done:
-            _, done = downloader.next_chunk()
+            status, done = downloader.next_chunk()
+            if status:
+                print(f"    Download {int(status.progress() * 100)}%")
 
 
 def move_to_claimed(service, file_id):
-    """Move file from source folder to claimed folder."""
     if not CLAIMED_FOLDER_ID:
         print("  GDRIVE_CLAIMED_FOLDER_ID not set — skipping move.")
         return
@@ -161,8 +153,7 @@ def move_to_claimed(service, file_id):
         removeParents=previous_parents,
         fields="id, parents",
     ).execute()
-    print(f"  Moved file {file_id} → claimed folder.")
-
+    print(f"  Moved {file_id} -> claimed folder.")
 
 # ── Caption helpers ───────────────────────────────────────────────────────────
 
@@ -175,12 +166,8 @@ def load_caption_rows(path):
 
 
 def build_text_csv(row, link=""):
-    parts = [
-        row["Action Caption"].strip(),
-        row["Caption"].strip(),
-        "",
-        row["Hashtags"].strip(),
-    ]
+    parts = [row["Action Caption"].strip(), row["Caption"].strip(),
+             "", row["Hashtags"].strip()]
     text = "\n".join(parts)
     if link:
         text += f"\n\n{link}"
@@ -193,11 +180,64 @@ def build_text_custom(raw, link=""):
         text += f"\n\n{link}"
     return text
 
-
 # ── X / Playwright posting ────────────────────────────────────────────────────
+
+def attach_media(page, media_path, mime_type):
+    """
+    Attach a local file to the X compose box.
+
+    X renders the file input as hidden. The correct approach is:
+      1. Use page.locator('input[type="file"]') — do NOT filter by data-testid.
+      2. Call set_input_files() directly without clicking (hidden inputs can't be clicked).
+      3. Wait for the media preview thumbnail to appear before posting.
+    """
+    is_video = mime_type in VIDEO_MIMES
+
+    # X exposes a hidden <input type="file"> that accepts both images and videos.
+    # There are sometimes multiple; the first one is always the compose-box attachment.
+    file_input = page.locator('input[type="file"]').first
+
+    # set_input_files works on hidden inputs — no click needed
+    file_input.set_input_files(media_path)
+    print("  File attached, waiting for preview…")
+
+    if is_video:
+        # For video: wait for the video thumbnail / processing indicator
+        # X shows a [data-testid="videoComponent"] or a progress bar while processing
+        try:
+            # Wait until a video element or thumbnail appears in the composer
+            page.wait_for_selector(
+                '[data-testid="videoComponent"], [data-testid="attachments"] video, '
+                '[data-testid="tweetPhoto"]',
+                timeout=60_000,
+            )
+            print("  Video preview visible.")
+        except PWTimeout:
+            # Also acceptable: the progress bar disappears
+            print("  Warning: video preview selector timed out — checking progress bar…")
+            try:
+                page.wait_for_selector(
+                    '[role="progressbar"]', state="detached", timeout=60_000
+                )
+                print("  Progress bar gone — continuing.")
+            except PWTimeout:
+                print("  Warning: could not confirm video upload, posting anyway.")
+    else:
+        # For images: wait for the thumbnail preview in the compose box
+        try:
+            page.wait_for_selector(
+                '[data-testid="tweetPhoto"], [data-testid="attachments"] img',
+                timeout=30_000,
+            )
+            print("  Image preview visible.")
+        except PWTimeout:
+            print("  Warning: image preview selector timed out — posting anyway.")
+
 
 def post_one(page, text, media_path, mime_type):
     page.goto("https://x.com/compose/post", wait_until="domcontentloaded")
+    # Extra settle time — the compose page JS can be slow to initialise
+    page.wait_for_timeout(2_000)
 
     if "login" in page.url:
         raise RuntimeError(
@@ -205,39 +245,38 @@ def post_one(page, text, media_path, mime_type):
             "Re-run login_and_save_session.py and refresh X_STORAGE_STATE_JSON."
         )
 
+    # ── Type caption ──────────────────────────────────────────────────────────
     textbox = page.get_by_test_id("tweetTextarea_0")
     textbox.wait_for(state="visible", timeout=15_000)
     textbox.click()
-    textbox.fill(text)
+    # Use type() instead of fill() so X's React state registers every keystroke
+    page.keyboard.type(text, delay=20)
+    page.wait_for_timeout(500)
 
-    # Attach media
-    file_input = page.locator('input[data-testid="fileInput"]')
-    if file_input.count() == 0:
-        # Click the media button to reveal the file input
-        page.get_by_test_id("attachments").click()
-        file_input = page.locator('input[type="file"]').first
+    # ── Attach media ──────────────────────────────────────────────────────────
+    attach_media(page, media_path, mime_type)
 
-    file_input.set_input_files(media_path)
+    # ── Small settle before posting ───────────────────────────────────────────
+    page.wait_for_timeout(1_500)
 
-    # Wait for upload indicator to clear
-    is_video = mime_type in VIDEO_MIMES
-    upload_timeout = 120_000 if is_video else 40_000
-    try:
-        page.wait_for_selector('[data-testid="attachments"] [role="progressbar"]',
-                               state="detached", timeout=upload_timeout)
-    except PWTimeout:
-        print("  Warning: upload progress bar still visible — posting anyway.")
-
+    # ── Click Post ────────────────────────────────────────────────────────────
     post_button = page.get_by_test_id("tweetButton")
     post_button.wait_for(state="visible", timeout=10_000)
+    post_button.wait_for(state="enabled", timeout=10_000)
     post_button.click()
-    page.wait_for_timeout(5_000)
+
+    # Wait for the compose overlay to close (confirms the post went through)
+    try:
+        page.wait_for_selector('[data-testid="tweetTextarea_0"]',
+                               state="detached", timeout=15_000)
+    except PWTimeout:
+        pass  # Some X versions navigate away instead of detaching
+    page.wait_for_timeout(3_000)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # Validate caption config
     if CAPTION_SOURCE == "custom":
         if not CUSTOM_CAPTION_RAW.strip():
             sys.exit("CAPTION_SOURCE=custom but CUSTOM_CAPTION is empty.")
@@ -247,14 +286,15 @@ def main():
     else:
         sys.exit(f"Unknown CAPTION_SOURCE '{CAPTION_SOURCE}'.")
 
-    # Optional per-post links
     links = [l.strip() for l in LINKS_RAW.split(",") if l.strip()]
 
-    # Build Drive service & pick media
     print("Connecting to Google Drive…")
     service = build_drive_service()
     all_files = list_media_in_folder(service, SOURCE_FOLDER_ID)
     print(f"Found {len(all_files)} media file(s) in source folder.")
+
+    if not all_files:
+        sys.exit("Source folder is empty — nothing to post.")
 
     chosen = select_media(all_files, POST_COUNT, IMAGE_RATIO)
     if SHUFFLE:
@@ -263,7 +303,7 @@ def main():
     n_images = sum(1 for f in chosen if f["mimeType"] in IMAGE_MIMES)
     n_videos = len(chosen) - n_images
     print(f"Selected {len(chosen)} file(s): {n_images} image(s), {n_videos} video(s).")
-    print(f"Interval: {INTERVAL_MINUTES} min  |  Caption mode: {CAPTION_SOURCE}")
+    print(f"Interval: {INTERVAL_MINUTES} min  |  Caption: {CAPTION_SOURCE}")
 
     est = (len(chosen) - 1) * INTERVAL_MINUTES
     print(f"Estimated run time: ~{est:.0f} min.")
@@ -271,9 +311,17 @@ def main():
         print("WARNING: may exceed GitHub's 6-hour job limit.")
 
     with sync_playwright() as p:
-        device = p.devices["iPhone 13"]
+        # Use a desktop viewport — mobile viewports can hide the file input entirely
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(storage_state=STORAGE_STATE_PATH, **device)
+        context = browser.new_context(
+            storage_state=STORAGE_STATE_PATH,
+            viewport={"width": 1280, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        )
         page = context.new_page()
 
         for i, media_file in enumerate(chosen, start=1):
@@ -290,25 +338,30 @@ def main():
             )
 
             print(f"\n[{i}/{len(chosen)}] {media_file['name']} ({media_file['mimeType']})")
-            print(f"  Caption preview: {text[:80].replace(chr(10),' ')}…")
+            print(f"  Caption: {text[:80].replace(chr(10), ' ')}…")
 
             with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
                 tmp_path = tmp.name
 
+            success = False
             try:
-                print(f"  Downloading from Drive…")
+                print("  Downloading from Drive…")
                 download_file(service, media_file["id"], tmp_path)
+                size_kb = Path(tmp_path).stat().st_size // 1024
+                print(f"  Downloaded: {size_kb} KB")
 
-                print(f"  Posting to X…")
+                print("  Posting to X…")
                 post_one(page, text, tmp_path, media_file["mimeType"])
-                print(f"[{i}/{len(chosen)}] Posted ✓")
-
-                move_to_claimed(service, media_file["id"])
+                print(f"[{i}/{len(chosen)}] Posted OK")
+                success = True
 
             except Exception as e:
                 print(f"[{i}/{len(chosen)}] FAILED: {e}")
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
+
+            if success:
+                move_to_claimed(service, media_file["id"])
 
             if i < len(chosen):
                 print(f"  Sleeping {INTERVAL_SECONDS}s before next post…")
