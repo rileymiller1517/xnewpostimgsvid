@@ -1,0 +1,88 @@
+name: Bulk Post Media to X
+
+on:
+  workflow_dispatch:
+    inputs:
+      post_count:
+        description: "How many posts to publish this run"
+        required: false
+        default: "5"
+      caption_source:
+        description: "Caption source"
+        type: choice
+        options:
+          - csv
+          - custom
+        default: csv
+      custom_caption:
+        description: "Only used if caption_source=custom. Use \\n for line breaks."
+        required: false
+        default: ""
+      links:
+        description: "Optional comma-separated links — one per post, in order (leave blank to omit links)"
+        required: false
+        default: ""
+      interval_minutes:
+        description: "Minutes to wait between posts"
+        required: false
+        default: "10"
+      shuffle:
+        description: "Shuffle media order? (true/false)"
+        required: false
+        default: "false"
+      image_ratio:
+        description: "Fraction of posts that should be images, e.g. 0.6 = 60% images / 40% videos"
+        required: false
+        default: "0.6"
+      source_folder_id:
+        description: "Google Drive folder ID to pick media FROM (overrides secret default)"
+        required: false
+        default: ""
+      claimed_folder_id:
+        description: "Google Drive folder ID to MOVE posted media INTO (overrides secret default)"
+        required: false
+        default: ""
+
+jobs:
+  bulk-post-media:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # GitHub hard cap on hosted runners
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          pip install playwright google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+          playwright install --with-deps chromium
+
+      - name: Write X session state
+        env:
+          STATE_JSON: ${{ secrets.X_STORAGE_STATE_JSON }}
+        run: printf '%s' "$STATE_JSON" > x_storage_state.json
+
+      - name: Run media poster
+        env:
+          # ── Google Drive ──────────────────────────────────────────────────
+          GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
+          # Folder IDs: workflow input takes precedence, falls back to secret
+          GDRIVE_SOURCE_FOLDER_ID: ${{ github.event.inputs.source_folder_id != '' && github.event.inputs.source_folder_id || secrets.GDRIVE_SOURCE_FOLDER_ID }}
+          GDRIVE_CLAIMED_FOLDER_ID: ${{ github.event.inputs.claimed_folder_id != '' && github.event.inputs.claimed_folder_id || secrets.GDRIVE_CLAIMED_FOLDER_ID }}
+          # ── Post settings ─────────────────────────────────────────────────
+          POST_COUNT: ${{ github.event.inputs.post_count }}
+          CAPTION_SOURCE: ${{ github.event.inputs.caption_source }}
+          CUSTOM_CAPTION: ${{ github.event.inputs.custom_caption }}
+          LINKS: ${{ github.event.inputs.links }}
+          INTERVAL_MINUTES: ${{ github.event.inputs.interval_minutes }}
+          SHUFFLE_ORDER: ${{ github.event.inputs.shuffle }}
+          IMAGE_RATIO: ${{ github.event.inputs.image_ratio }}
+          # ── Paths ─────────────────────────────────────────────────────────
+          X_STORAGE_STATE_PATH: x_storage_state.json
+          POSTS_CSV_PATH: table.csv
+        run: python bulk_post_media_to_x.py
