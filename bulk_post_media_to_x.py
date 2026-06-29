@@ -36,7 +36,6 @@ SCREENSHOT_DIR.mkdir(exist_ok=True)
 step_counter = [0]
 
 def dbg(msg):
-    """Timestamped debug print, always flushed immediately."""
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
@@ -182,143 +181,547 @@ def build_text_custom(raw, link=""):
 
 # ── X / Playwright posting ────────────────────────────────────────────────────
 
-def post_one(page, text, media_path, mime_type, post_index):
+# All known selectors for the tweet textbox, in priority order
+TEXTBOX_SELECTORS = [
+    '[data-testid="tweetTextarea_0"]',
+    '[data-testid="tweetTextarea_0EditorContainer"] div[contenteditable="true"]',
+    'div[contenteditable="true"][data-testid]',
+    'div[contenteditable="true"][aria-label]',
+    'div[contenteditable="true"]',
+    '[aria-label="Post text"]',
+    '[aria-label="Tweet text"]',
+    '[placeholder="What is happening?!"]',
+    '[placeholder*="happening"]',
+]
+
+# All known selectors for the post/tweet submit button
+POST_BUTTON_SELECTORS = [
+    '[data-testid="tweetButton"]',
+    '[data-testid="tweetButtonInline"]',
+    'button[data-testid*="tweet"]',
+    'div[data-testid="tweetButton"]',
+    'button:has-text("Post")',
+    'button:has-text("Tweet")',
+    '[aria-label="Post"]',
+    '[aria-label="Tweet"]',
+]
+
+# Selectors for media upload button (to click and reveal file input)
+MEDIA_BUTTON_SELECTORS = [
+    '[data-testid="fileInput"]',
+    'input[type="file"]',
+    '[data-testid="addMedia"]',
+    'button[aria-label*="Media"]',
+    'button[aria-label*="photo"]',
+    'button[aria-label*="image"]',
+    'label[for*="file"]',
+]
+
+# Preview selectors to confirm media attached
+PREVIEW_SELECTORS = [
+    '[data-testid="attachments"] video',
+    '[data-testid="videoComponent"]',
+    '[data-testid="tweetPhoto"]',
+    '[data-testid="attachments"] img',
+    '[data-testid="attachments"] [role="progressbar"]',
+    '[data-testid="attachments"]',
+    'img[src*="blob:"]',
+    'video[src*="blob:"]',
+]
+
+
+def find_element_multi(page, selectors, label, timeout=15_000):
+    """Try multiple selectors in order; return the first visible one."""
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            el.wait_for(state="visible", timeout=timeout // len(selectors))
+            dbg(f"    ✓ Found {label} via: {sel}")
+            return el
+        except Exception:
+            dbg(f"    ✗ Selector failed for {label}: {sel}")
+    return None
+
+
+def navigate_to_compose(page, post_index, attempt=1):
+    """Navigate to the compose page with retries."""
+    urls = [
+        "https://x.com/compose/post",
+        "https://twitter.com/compose/tweet",
+        "https://x.com/home",  # fallback: go home then click compose
+    ]
+    for url in urls[:2]:  # try direct compose URLs first
+        dbg(f"  [NAV] Attempt {attempt}: navigating to {url}")
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            page.wait_for_timeout(3_000)
+            current = page.url
+            dbg(f"  [NAV] Current URL: {current}")
+            screenshot(page, f"p{post_index}_nav_attempt{attempt}")
+
+            if "login" in current or "signin" in current:
+                raise RuntimeError(
+                    "Redirected to login — session expired. "
+                    "Re-run login_and_save_session.py and update X_STORAGE_STATE_JSON."
+                )
+            if "compose" in current or _textbox_visible(page):
+                dbg(f"  [NAV] Compose page confirmed.")
+                return True
+        except RuntimeError:
+            raise
+        except Exception as e:
+            dbg(f"  [NAV] Navigation to {url} failed: {e}")
+
+    # Last resort: go home and click the compose button
+    dbg("  [NAV] Trying home → compose button fallback…")
+    try:
+        page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30_000)
+        page.wait_for_timeout(3_000)
+        compose_btn = page.locator(
+            'a[href="/compose/post"], '
+            '[data-testid="SideNav_NewTweet_Button"], '
+            '[aria-label="Post"], '
+            'a[aria-label*="compose"]'
+        ).first
+        compose_btn.wait_for(state="visible", timeout=10_000)
+        compose_btn.click()
+        page.wait_for_timeout(3_000)
+        screenshot(page, f"p{post_index}_nav_home_fallback")
+        if _textbox_visible(page):
+            dbg("  [NAV] Home fallback worked.")
+            return True
+    except Exception as e:
+        dbg(f"  [NAV] Home fallback failed: {e}")
+
+    return False
+
+
+def _textbox_visible(page):
+    for sel in TEXTBOX_SELECTORS[:3]:
+        try:
+            el = page.locator(sel).first
+            if el.is_visible():
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def type_text_robust(page, text, post_index):
+    """Find textbox and type text using multiple methods."""
+    dbg("  [TYPE] Looking for tweet textbox…")
+    textbox = find_element_multi(page, TEXTBOX_SELECTORS, "textbox", timeout=20_000)
+
+    if textbox is None:
+        screenshot(page, f"p{post_index}_type_no_textbox")
+        # Dump all contenteditable elements for diagnosis
+        all_ce = page.locator('[contenteditable="true"]').all()
+        dbg(f"  [TYPE] Found {len(all_ce)} contenteditable elements:")
+        for el in all_ce:
+            try:
+                dbg(f"    testid={el.get_attribute('data-testid')} aria={el.get_attribute('aria-label')}")
+            except Exception:
+                pass
+        raise RuntimeError("Could not find tweet textbox with any known selector.")
+
+    # Method 1: click + keyboard.type
+    try:
+        textbox.scroll_into_view_if_needed()
+        textbox.click()
+        page.wait_for_timeout(500)
+        page.keyboard.type(text, delay=15)
+        page.wait_for_timeout(500)
+        dbg(f"  [TYPE] Typed via keyboard.type ({len(text)} chars).")
+        return
+    except Exception as e:
+        dbg(f"  [TYPE] keyboard.type failed: {e} — trying fill…")
+
+    # Method 2: fill (works on some contenteditable)
+    try:
+        textbox.fill(text)
+        page.wait_for_timeout(500)
+        dbg(f"  [TYPE] Typed via fill ({len(text)} chars).")
+        return
+    except Exception as e:
+        dbg(f"  [TYPE] fill failed: {e} — trying JS innerText…")
+
+    # Method 3: JS injection
+    try:
+        page.evaluate(
+            """(args) => {
+                const el = document.querySelector(args.sel);
+                if (el) {
+                    el.focus();
+                    el.innerText = args.text;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            }""",
+            {"sel": TEXTBOX_SELECTORS[0], "text": text},
+        )
+        page.wait_for_timeout(500)
+        dbg(f"  [TYPE] Typed via JS innerText.")
+        return
+    except Exception as e:
+        dbg(f"  [TYPE] JS innerText failed: {e}")
+        raise RuntimeError("All text-input methods failed.")
+
+
+def attach_media_robust(page, media_path, mime_type, post_index):
+    """Attach a file using multiple strategies."""
+    is_video = mime_type in VIDEO_MIMES
+    upload_timeout = 120_000 if is_video else 45_000
+
+    # ── Strategy A: set_input_files on hidden file input ─────────────────────
+    dbg("  [ATTACH-A] Looking for file input directly…")
+    file_inputs = page.locator('input[type="file"]')
+    count = file_inputs.count()
+    dbg(f"  [ATTACH-A] Found {count} file input(s).")
+
+    if count > 0:
+        for idx in range(count):
+            inp = file_inputs.nth(idx)
+            accept = inp.get_attribute("accept") or ""
+            dbg(f"  [ATTACH-A] Input #{idx}: accept='{accept}'")
+            # Pick input that accepts images/videos
+            if (is_video and ("video" in accept or accept == "")) or \
+               (not is_video and ("image" in accept or accept == "")):
+                try:
+                    inp.set_input_files(media_path)
+                    dbg(f"  [ATTACH-A] set_input_files on input #{idx} — success.")
+                    if _wait_for_preview(page, upload_timeout, post_index, "A"):
+                        return True
+                except Exception as e:
+                    dbg(f"  [ATTACH-A] set_input_files #{idx} failed: {e}")
+
+        # Try all inputs if targeted one failed
+        for idx in range(count):
+            try:
+                file_inputs.nth(idx).set_input_files(media_path)
+                dbg(f"  [ATTACH-A] Fallback: set_input_files on input #{idx}.")
+                if _wait_for_preview(page, upload_timeout, post_index, f"A-fallback{idx}"):
+                    return True
+            except Exception as e:
+                dbg(f"  [ATTACH-A] Fallback #{idx} failed: {e}")
+
+    # ── Strategy B: click media toolbar button, then set_input_files ─────────
+    dbg("  [ATTACH-B] Clicking media toolbar button to reveal file input…")
+    media_btn_selectors = [
+        '[data-testid="addMedia"]',
+        '[aria-label*="edia"]',
+        '[aria-label*="hoto"]',
+        'button:has([data-testid="addMedia"])',
+        'div[role="button"]:has([data-testid="addMedia"])',
+        'label[data-testid="fileInput"]',
+    ]
+    for btn_sel in media_btn_selectors:
+        try:
+            btn = page.locator(btn_sel).first
+            if btn.is_visible():
+                btn.click()
+                page.wait_for_timeout(1_000)
+                dbg(f"  [ATTACH-B] Clicked button: {btn_sel}")
+                # After clicking, try file inputs again
+                file_inputs2 = page.locator('input[type="file"]')
+                if file_inputs2.count() > 0:
+                    file_inputs2.first.set_input_files(media_path)
+                    dbg("  [ATTACH-B] set_input_files after button click — success.")
+                    if _wait_for_preview(page, upload_timeout, post_index, "B"):
+                        return True
+        except Exception as e:
+            dbg(f"  [ATTACH-B] Button {btn_sel} failed: {e}")
+
+    # ── Strategy C: dispatch file via JS FileList ─────────────────────────────
+    dbg("  [ATTACH-C] Trying JS FileList dispatch…")
+    try:
+        with open(media_path, "rb") as f:
+            file_bytes = f.read()
+        import base64
+        b64 = base64.b64encode(file_bytes).decode()
+        file_name = Path(media_path).name
+
+        js_result = page.evaluate(
+            """async (args) => {
+                const byteChars = atob(args.b64);
+                const byteNums = new Array(byteChars.length);
+                for (let i = 0; i < byteChars.length; i++) {
+                    byteNums[i] = byteChars.charCodeAt(i);
+                }
+                const byteArr = new Uint8Array(byteNums);
+                const blob = new Blob([byteArr], { type: args.mimeType });
+                const file = new File([blob], args.fileName, { type: args.mimeType });
+
+                const input = document.querySelector('input[type="file"]');
+                if (!input) return 'no-input';
+
+                const dt = new DataTransfer();
+                dt.items.add(file);
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'files'
+                );
+                input.files = dt.files;
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                return 'ok';
+            }""",
+            {"b64": b64, "mimeType": mime_type, "fileName": file_name},
+        )
+        dbg(f"  [ATTACH-C] JS result: {js_result}")
+        if js_result == "ok":
+            if _wait_for_preview(page, upload_timeout, post_index, "C"):
+                return True
+    except Exception as e:
+        dbg(f"  [ATTACH-C] JS FileList failed: {e}")
+
+    # ── Strategy D: drag-and-drop simulation ─────────────────────────────────
+    dbg("  [ATTACH-D] Trying drag-and-drop simulation…")
+    try:
+        with open(media_path, "rb") as f:
+            file_bytes = f.read()
+        import base64
+        b64 = base64.b64encode(file_bytes).decode()
+
+        js_result = page.evaluate(
+            """async (args) => {
+                const byteChars = atob(args.b64);
+                const byteNums = new Array(byteChars.length);
+                for (let i = 0; i < byteChars.length; i++) {
+                    byteNums[i] = byteChars.charCodeAt(i);
+                }
+                const byteArr = new Uint8Array(byteNums);
+                const blob = new Blob([byteArr], { type: args.mimeType });
+                const file = new File([blob], args.fileName, { type: args.mimeType });
+
+                const dt = new DataTransfer();
+                dt.items.add(file);
+
+                const target = document.querySelector(
+                    '[data-testid="tweetTextarea_0EditorContainer"], '
+                    + '[data-testid="tweetTextarea_0"], '
+                    + 'div[contenteditable="true"]'
+                );
+                if (!target) return 'no-target';
+
+                const events = ['dragenter', 'dragover', 'drop'];
+                for (const evtName of events) {
+                    const evt = new DragEvent(evtName, {
+                        bubbles: true,
+                        cancelable: true,
+                        dataTransfer: dt,
+                    });
+                    target.dispatchEvent(evt);
+                    await new Promise(r => setTimeout(r, 100));
+                }
+                return 'ok';
+            }""",
+            {"b64": b64, "mimeType": mime_type, "fileName": Path(media_path).name},
+        )
+        dbg(f"  [ATTACH-D] JS drag result: {js_result}")
+        if js_result == "ok":
+            if _wait_for_preview(page, upload_timeout, post_index, "D"):
+                return True
+    except Exception as e:
+        dbg(f"  [ATTACH-D] Drag-drop simulation failed: {e}")
+
+    screenshot(page, f"p{post_index}_attach_all_failed")
+    raise RuntimeError("All media attachment strategies failed.")
+
+
+def _wait_for_preview(page, timeout, post_index, strategy_label):
+    """Wait for a media preview to appear. Returns True on success."""
+    dbg(f"  [PREVIEW-{strategy_label}] Waiting for media preview (timeout={timeout}ms)…")
+    for sel in PREVIEW_SELECTORS:
+        try:
+            page.wait_for_selector(sel, timeout=timeout // len(PREVIEW_SELECTORS))
+            dbg(f"  [PREVIEW-{strategy_label}] Preview appeared: {sel}")
+            # If progress bar, wait for it to finish
+            _wait_for_upload_finish(page, timeout)
+            page.wait_for_timeout(1_500)
+            screenshot(page, f"p{post_index}_preview_{strategy_label}")
+            return True
+        except Exception:
+            pass
+
+    # Final check: just wait a bit and see if attachments area appears
+    page.wait_for_timeout(3_000)
+    attach = page.locator('[data-testid="attachments"]')
+    if attach.count() > 0:
+        dbg(f"  [PREVIEW-{strategy_label}] Attachments area found (fallback check).")
+        _wait_for_upload_finish(page, timeout)
+        screenshot(page, f"p{post_index}_preview_{strategy_label}_fallback")
+        return True
+
+    dbg(f"  [PREVIEW-{strategy_label}] No preview detected.")
+    screenshot(page, f"p{post_index}_no_preview_{strategy_label}")
+    return False
+
+
+def _wait_for_upload_finish(page, timeout):
+    """Wait for any progress bar to disappear."""
+    try:
+        progress = page.locator('[role="progressbar"]')
+        if progress.count() > 0:
+            dbg("  [UPLOAD] Progress bar visible — waiting for completion…")
+            page.wait_for_selector('[role="progressbar"]', state="detached", timeout=timeout)
+            dbg("  [UPLOAD] Upload complete.")
+    except Exception as e:
+        dbg(f"  [UPLOAD] Progress bar wait: {e}")
+
+
+def click_post_button(page, post_index):
+    """Click the post/tweet button with multiple selector fallbacks."""
+    dbg("  [POST-BTN] Locating Post button…")
+    post_btn = find_element_multi(page, POST_BUTTON_SELECTORS, "post button", timeout=15_000)
+
+    if post_btn is None:
+        screenshot(page, f"p{post_index}_no_post_button")
+        # Dump all buttons
+        all_btns = page.locator("button").all()
+        dbg(f"  [POST-BTN] All buttons ({len(all_btns)}):")
+        for b in all_btns[:20]:
+            try:
+                dbg(f"    testid={b.get_attribute('data-testid')} text={b.inner_text()[:40]}")
+            except Exception:
+                pass
+        raise RuntimeError("Post button not found with any known selector.")
+
+    is_disabled = post_btn.is_disabled()
+    dbg(f"  [POST-BTN] Found. Disabled={is_disabled}")
+    screenshot(page, f"p{post_index}_before_post_click")
+
+    if is_disabled:
+        dbg("  [POST-BTN] Button disabled — waiting up to 15s…")
+        for wait_round in range(3):
+            page.wait_for_timeout(5_000)
+            is_disabled = post_btn.is_disabled()
+            dbg(f"  [POST-BTN] After {(wait_round+1)*5}s: Disabled={is_disabled}")
+            if not is_disabled:
+                break
+
+    # Click with fallback methods
+    try:
+        post_btn.click()
+        dbg("  [POST-BTN] Clicked via .click().")
+    except Exception as e:
+        dbg(f"  [POST-BTN] .click() failed: {e} — trying JS click…")
+        try:
+            page.evaluate(
+                """(sel) => {
+                    for (const s of sel) {
+                        const el = document.querySelector(s);
+                        if (el) { el.click(); return s; }
+                    }
+                    return null;
+                }""",
+                POST_BUTTON_SELECTORS,
+            )
+            dbg("  [POST-BTN] JS click executed.")
+        except Exception as e2:
+            dbg(f"  [POST-BTN] JS click also failed: {e2}")
+            raise RuntimeError("Could not click Post button.")
+
+
+def confirm_post_sent(page, post_index):
+    """Wait for compose box to close or URL to change — confirms post was sent."""
+    dbg("  [CONFIRM] Waiting for compose box to close…")
+    screenshot(page, f"p{post_index}_after_click")
+
+    # Method 1: compose textbox disappears
+    try:
+        page.wait_for_selector('[data-testid="tweetTextarea_0"]',
+                               state="detached", timeout=20_000)
+        dbg("  [CONFIRM] ✓ Compose box closed — post confirmed!")
+        page.wait_for_timeout(3_000)
+        screenshot(page, f"p{post_index}_final_state")
+        return True
+    except PWTimeout:
+        dbg("  [CONFIRM] Compose box still open — checking alternative signals…")
+
+    # Method 2: URL changed away from /compose
+    page.wait_for_timeout(3_000)
+    current_url = page.url
+    dbg(f"  [CONFIRM] Current URL: {current_url}")
+    if "compose" not in current_url:
+        dbg("  [CONFIRM] ✓ URL changed — post likely sent.")
+        screenshot(page, f"p{post_index}_final_state")
+        return True
+
+    # Method 3: toast/notification appeared
+    try:
+        page.wait_for_selector(
+            '[data-testid="toast"], [aria-label*="sent"], [aria-label*="posted"]',
+            timeout=5_000,
+        )
+        dbg("  [CONFIRM] ✓ Toast notification appeared — post sent!")
+        screenshot(page, f"p{post_index}_final_state")
+        return True
+    except Exception:
+        pass
+
+    screenshot(page, f"p{post_index}_confirm_uncertain")
+    dbg("  [CONFIRM] ⚠ Could not confirm post was sent — marking uncertain.")
+    return False
+
+
+def post_one(page, text, media_path, mime_type, post_index, max_attempts=3):
+    """Post one piece of media with full retry logic."""
     is_video = mime_type in VIDEO_MIMES
     media_type_label = "VIDEO" if is_video else "IMAGE"
 
-    # ── 1. Navigate ───────────────────────────────────────────────────────────
-    dbg(f"  [STEP 1] Navigating to x.com/compose/post…")
-    page.goto("https://x.com/compose/post", wait_until="domcontentloaded")
-    page.wait_for_timeout(3_000)
-    dbg(f"  [STEP 1] Current URL after nav: {page.url}")
-    screenshot(page, f"p{post_index}_01_after_nav")
+    for attempt in range(1, max_attempts + 1):
+        dbg(f"  ─── Post attempt {attempt}/{max_attempts} ───")
+        try:
+            # ── 1. Navigate ───────────────────────────────────────────────────
+            dbg(f"  [STEP 1] Navigating to compose page…")
+            navigate_to_compose(page, post_index, attempt)
 
-    if "login" in page.url:
-        screenshot(page, f"p{post_index}_LOGIN_WALL")
-        raise RuntimeError(
-            "Redirected to login page — session is expired. "
-            "Re-run login_and_save_session.py locally and update X_STORAGE_STATE_JSON secret."
-        )
+            # ── 2. Type caption ───────────────────────────────────────────────
+            dbg(f"  [STEP 2] Typing caption…")
+            type_text_robust(page, text, post_index)
+            screenshot(page, f"p{post_index}_a{attempt}_caption_typed")
+            dbg(f"  [STEP 2] Caption typed ({len(text)} chars).")
 
-    # ── 2. Find & fill textbox ────────────────────────────────────────────────
-    dbg(f"  [STEP 2] Waiting for tweet textbox…")
-    try:
-        textbox = page.get_by_test_id("tweetTextarea_0")
-        textbox.wait_for(state="visible", timeout=15_000)
-        dbg(f"  [STEP 2] Textbox found. Clicking and typing caption…")
-        textbox.click()
-        page.wait_for_timeout(300)
-        page.keyboard.type(text, delay=15)
-        page.wait_for_timeout(500)
-        dbg(f"  [STEP 2] Caption typed ({len(text)} chars).")
-        screenshot(page, f"p{post_index}_02_caption_typed")
-    except PWTimeout:
-        screenshot(page, f"p{post_index}_02_TEXTBOX_TIMEOUT")
-        raise RuntimeError("Timed out waiting for tweet textbox — page may not have loaded properly.")
+            # ── 3. Attach media ───────────────────────────────────────────────
+            dbg(f"  [STEP 3] Attaching {media_type_label}: {media_path}")
+            attach_media_robust(page, media_path, mime_type, post_index)
+            dbg(f"  [STEP 3] {media_type_label} attached successfully.")
 
-    # ── 3. Find file input ────────────────────────────────────────────────────
-    dbg(f"  [STEP 3] Looking for file input (type=file)…")
-    file_inputs = page.locator('input[type="file"]')
-    count = file_inputs.count()
-    dbg(f"  [STEP 3] Found {count} file input(s) on page.")
+            # ── 4. Click Post ─────────────────────────────────────────────────
+            dbg(f"  [STEP 4] Clicking Post button…")
+            click_post_button(page, post_index)
 
-    if count == 0:
-        screenshot(page, f"p{post_index}_03_NO_FILE_INPUT")
-        # Dump all input elements for diagnosis
-        all_inputs = page.locator("input").all()
-        dbg(f"  [STEP 3] All inputs on page ({len(all_inputs)}):")
-        for inp in all_inputs:
+            # ── 5. Confirm ────────────────────────────────────────────────────
+            dbg(f"  [STEP 5] Confirming post sent…")
+            sent = confirm_post_sent(page, post_index)
+            if sent:
+                dbg(f"  Post #{post_index} SUCCESS on attempt {attempt}.")
+                return True
+            else:
+                dbg(f"  Post #{post_index} unconfirmed on attempt {attempt} — retrying.")
+                page.wait_for_timeout(5_000)
+
+        except RuntimeError as e:
+            dbg(f"  [ATTEMPT {attempt}] RuntimeError: {e}")
+            if "login" in str(e).lower() or "session" in str(e).lower():
+                raise  # don't retry auth failures
+            if attempt < max_attempts:
+                dbg(f"  Waiting 10s before retry…")
+                page.wait_for_timeout(10_000)
+            else:
+                raise
+        except Exception as e:
+            dbg(f"  [ATTEMPT {attempt}] Unexpected error: {e}")
             try:
-                dbg(f"    type={inp.get_attribute('type')} | "
-                    f"data-testid={inp.get_attribute('data-testid')} | "
-                    f"accept={inp.get_attribute('accept')}")
+                screenshot(page, f"p{post_index}_a{attempt}_exception")
             except Exception:
                 pass
-        raise RuntimeError("No file input found on compose page — X may have changed its DOM.")
+            if attempt < max_attempts:
+                dbg(f"  Waiting 10s before retry…")
+                page.wait_for_timeout(10_000)
+            else:
+                raise
 
-    file_input = file_inputs.first
-    dbg(f"  [STEP 3] Using first file input. accept='{file_input.get_attribute('accept')}'")
-
-    # ── 4. Attach file ────────────────────────────────────────────────────────
-    dbg(f"  [STEP 4] Attaching {media_type_label}: {media_path} ({mime_type})…")
-    file_input.set_input_files(media_path)
-    dbg(f"  [STEP 4] set_input_files() called. Waiting for media preview…")
-    screenshot(page, f"p{post_index}_04_after_attach")
-
-    # ── 5. Wait for preview / upload to complete ──────────────────────────────
-    dbg(f"  [STEP 5] Waiting for {media_type_label} preview to appear…")
-    preview_selectors = (
-        '[data-testid="attachments"] video, '
-        '[data-testid="videoComponent"], '
-        '[data-testid="tweetPhoto"], '
-        '[data-testid="attachments"] img, '
-        '[data-testid="attachments"] [role="progressbar"]'
-    )
-    upload_timeout = 90_000 if is_video else 30_000
-    try:
-        page.wait_for_selector(preview_selectors, timeout=upload_timeout)
-        dbg(f"  [STEP 5] Preview/upload indicator appeared.")
-        screenshot(page, f"p{post_index}_05_preview_appeared")
-    except PWTimeout:
-        screenshot(page, f"p{post_index}_05_PREVIEW_TIMEOUT")
-        dbg(f"  [STEP 5] WARNING: no preview appeared within timeout — dumping page state…")
-        dbg(f"    Page URL: {page.url}")
-        dbg(f"    Page title: {page.title()}")
-        # Check if attachment area exists at all
-        attach_area = page.locator('[data-testid="attachments"]')
-        dbg(f"    [data-testid='attachments'] count: {attach_area.count()}")
-        dbg(f"  [STEP 5] Proceeding anyway…")
-
-    # If it's a progress bar, wait for it to finish
-    progress_bar = page.locator('[role="progressbar"]')
-    if progress_bar.count() > 0:
-        dbg(f"  [STEP 5b] Progress bar visible — waiting for upload to finish…")
-        try:
-            page.wait_for_selector('[role="progressbar"]', state="detached",
-                                   timeout=upload_timeout)
-            dbg(f"  [STEP 5b] Upload complete (progress bar gone).")
-        except PWTimeout:
-            dbg(f"  [STEP 5b] WARNING: progress bar still visible after timeout — posting anyway.")
-        screenshot(page, f"p{post_index}_05b_after_progress")
-
-    page.wait_for_timeout(1_500)
-
-    # ── 6. Check Post button ──────────────────────────────────────────────────
-    dbg(f"  [STEP 6] Locating Post button…")
-    post_button = page.get_by_test_id("tweetButton")
-    try:
-        post_button.wait_for(state="visible", timeout=10_000)
-        is_disabled = post_button.is_disabled()
-        dbg(f"  [STEP 6] Post button visible. Disabled={is_disabled}")
-        screenshot(page, f"p{post_index}_06_before_click")
-        if is_disabled:
-            dbg(f"  [STEP 6] Button is disabled — waiting up to 10s for it to enable…")
-            page.wait_for_timeout(10_000)
-            is_disabled = post_button.is_disabled()
-            dbg(f"  [STEP 6] After wait: Disabled={is_disabled}")
-    except PWTimeout:
-        screenshot(page, f"p{post_index}_06_BUTTON_TIMEOUT")
-        raise RuntimeError("Post button not found/visible.")
-
-    # ── 7. Click Post ─────────────────────────────────────────────────────────
-    dbg(f"  [STEP 7] Clicking Post button…")
-    post_button.click()
-    dbg(f"  [STEP 7] Post button clicked. Waiting for confirmation…")
-    screenshot(page, f"p{post_index}_07_after_click")
-
-    # Wait for the compose dialog to close (means post was accepted)
-    try:
-        page.wait_for_selector('[data-testid="tweetTextarea_0"]',
-                               state="detached", timeout=15_000)
-        dbg(f"  [STEP 7] Compose box closed — post confirmed sent!")
-    except PWTimeout:
-        dbg(f"  [STEP 7] Compose box still open after 15s — checking URL…")
-        dbg(f"  [STEP 7] URL: {page.url}")
-        screenshot(page, f"p{post_index}_07_COMPOSE_STILL_OPEN")
-
-    page.wait_for_timeout(3_000)
-    screenshot(page, f"p{post_index}_08_final_state")
-    dbg(f"  Post sequence complete for post #{post_index}.")
+    raise RuntimeError(f"All {max_attempts} attempts failed for post #{post_index}.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -379,7 +782,13 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox"],
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+            ],
         )
         context = browser.new_context(
             storage_state=STORAGE_STATE_PATH,
@@ -389,12 +798,20 @@ def main():
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
+            # Accept all permissions that X might request
+            permissions=["notifications"],
         )
+
+        # Remove automation fingerprints
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        """)
+
         page = context.new_page()
 
-        # Log all console messages from the browser
+        # Log browser events
         page.on("console", lambda msg: dbg(f"  [BROWSER {msg.type.upper()}] {msg.text[:200]}"))
-        # Log failed network requests
         page.on("requestfailed", lambda req: dbg(f"  [NET FAIL] {req.url[:100]}"))
 
         dbg("Browser launched. Starting post loop…")
