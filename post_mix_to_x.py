@@ -113,17 +113,32 @@ def list_media_in_folder(service, folder_id, mimes):
     return results
 
 
-def download_file(service, file_id, file_name, dest_path):
-    dbg(f"  Downloading '{file_name}' -> {dest_path}")
-    request = service.files().get_media(fileId=file_id)
-    with open(dest_path, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-            if status:
-                dbg(f"    Download progress: {int(status.progress()*100)}%")
-    dbg("  Download complete.")
+def download_file(service, file_id, file_name, dest_path, max_attempts=4):
+    for attempt in range(1, max_attempts + 1):
+        dbg(f"  Downloading '{file_name}' -> {dest_path} (attempt {attempt}/{max_attempts})")
+        try:
+            request = service.files().get_media(fileId=file_id)
+            with open(dest_path, "wb") as fh:
+                downloader = MediaIoBaseDownload(fh, request)
+                done = False
+                while not done:
+                    status, done = downloader.next_chunk()
+                    if status:
+                        dbg(f"    Download progress: {int(status.progress()*100)}%")
+            dbg("  Download complete.")
+            return
+        except Exception as e:
+            dbg(f"  ⚠ Download attempt {attempt} failed: {e}")
+            try:
+                Path(dest_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            if attempt < max_attempts:
+                wait_s = 5 * attempt
+                dbg(f"  Retrying download in {wait_s}s…")
+                time.sleep(wait_s)
+            else:
+                raise
 
 
 def move_to_claimed(service, file_id, file_name):
@@ -335,14 +350,32 @@ def attach_media_robust(page, media_path, mime_type, post_index):
     file_inputs = page.locator('input[type="file"]')
     count = file_inputs.count()
     dbg(f"  [ATTACH] Found {count} file input(s).")
+
     if count > 0:
+        # Pass 1: only try inputs whose accept attribute matches our media type
+        for idx in range(count):
+            inp = file_inputs.nth(idx)
+            accept = inp.get_attribute("accept") or ""
+            dbg(f"  [ATTACH] Input #{idx}: accept='{accept}'")
+            if (is_video and ("video" in accept or accept == "")) or \
+               (not is_video and ("image" in accept or accept == "")):
+                try:
+                    inp.set_input_files(media_path)
+                    dbg(f"  [ATTACH] set_input_files on input #{idx} — success.")
+                    if _wait_for_preview(page, upload_timeout, post_index, f"slot{idx}"):
+                        return True
+                except Exception as e:
+                    dbg(f"  [ATTACH] input #{idx} failed: {e}")
+
+        # Pass 2: fallback — try every input regardless of accept attribute
         for idx in range(count):
             try:
                 file_inputs.nth(idx).set_input_files(media_path)
-                if _wait_for_preview(page, upload_timeout, post_index, f"slot{idx}"):
+                dbg(f"  [ATTACH] Fallback: set_input_files on input #{idx}.")
+                if _wait_for_preview(page, upload_timeout, post_index, f"fallback{idx}"):
                     return True
             except Exception as e:
-                dbg(f"  [ATTACH] input #{idx} failed: {e}")
+                dbg(f"  [ATTACH] Fallback input #{idx} failed: {e}")
 
     dbg("  [ATTACH] Trying media toolbar button…")
     for btn_sel in ['[data-testid="addMedia"]', '[aria-label*="edia"]', '[aria-label*="hoto"]']:
