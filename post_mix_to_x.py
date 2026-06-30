@@ -155,7 +155,15 @@ def build_sheet_client():
 
 def load_thread_rows(gc):
     sh = gc.open_by_key(SPREADSHEET_ID)
-    ws = sh.worksheet(SHEET_TAB_NAME)
+    try:
+        ws = sh.worksheet(SHEET_TAB_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        available = [w.title for w in sh.worksheets()]
+        dbg(f"Tab '{SHEET_TAB_NAME}' not found. Available tabs: {available}")
+        sys.exit(
+            f"SHEET_TAB_NAME '{SHEET_TAB_NAME}' does not exist in this spreadsheet. "
+            f"Available tabs: {available}. Set sheet_tab_name to one of these when running the workflow."
+        )
     col_index = ord(CAPTION_COLUMN.upper()) - ord("A") + 1
     values = ws.col_values(col_index)
     rows = []
