@@ -38,9 +38,9 @@ on:
         required: false
         default: "1QXCzLY_ygvJlCxdgDyh_oYkBxm5jSfDp56jtYQ1FVYw"
       sheet_tab_name:
-        description: "Tab name inside the sheet"
+        description: "Tab name inside the sheet (check your sheet's tab name at the bottom — e.g. 'Sheet1')"
         required: false
-        default: "threads"
+        default: "Sheet1"
       caption_column:
         description: "Column letter holding caption/thread text"
         required: false
