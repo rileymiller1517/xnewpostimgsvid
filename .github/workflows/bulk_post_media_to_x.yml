@@ -1,53 +1,58 @@
-name: Bulk Post Media to X
-
+name: Post Threads From Google Sheet to X
 on:
   workflow_dispatch:
     inputs:
-      post_count:
-        description: "How many posts to publish this run"
+      spreadsheet_id:
+        description: "Google Sheet ID (leave default unless using a different sheet)"
+        required: false
+        default: "1QXCzLY_ygvJlCxdgDyh_oYkBxm5jSfDp56jtYQ1FVYw"
+      sheet_tab_name:
+        description: "Tab name inside the sheet"
+        required: false
+        default: "threads"
+      caption_column:
+        description: "Column letter holding the caption/thread text"
+        required: false
+        default: "A"
+      thread_delimiter:
+        description: "Put this on its own line inside a cell to split one row into a multi-tweet thread"
+        required: false
+        default: "---"
+      max_threads:
+        description: "Max number of rows/threads to post this run (0 = all remaining rows)"
         required: false
         default: "5"
-      caption_source:
-        description: "Caption source"
-        type: choice
-        options:
-          - csv
-          - custom
-        default: csv
-      custom_caption:
-        description: "Only used if caption_source=custom. Use \\n for line breaks."
-        required: false
-        default: ""
-      links:
-        description: "Optional comma-separated links — one per post (leave blank to omit)"
-        required: false
-        default: ""
       interval_minutes:
-        description: "Minutes to wait between posts"
+        description: "Minutes to wait between threads"
         required: false
         default: "10"
       shuffle:
-        description: "Shuffle media order? (true/false)"
+        description: "Shuffle row order? (true/false)"
         required: false
         default: "false"
+      use_media:
+        description: "Attach an image/video from Drive to the first tweet of each thread? (true/false)"
+        type: choice
+        options:
+          - "false"
+          - "true"
+        default: "false"
       image_ratio:
-        description: "Fraction of posts that are images, e.g. 0.6 = 60% images / 40% videos"
+        description: "Only used if use_media=true. Fraction of attachments that are images, e.g. 0.6 = 60% images / 40% videos"
         required: false
         default: "0.6"
       source_folder_id:
-        description: "Google Drive folder ID to pick media FROM (overrides secret default)"
+        description: "Only used if use_media=true. Google Drive folder ID to pick media FROM"
         required: false
         default: ""
       claimed_folder_id:
-        description: "Google Drive folder ID to MOVE posted media INTO (overrides secret default)"
+        description: "Only used if use_media=true. Google Drive folder ID to MOVE used media INTO"
         required: false
         default: ""
-
 jobs:
-  bulk-post-media:
+  post-threads:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -59,7 +64,7 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install playwright google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+          pip install playwright gspread google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
           playwright install --with-deps chromium
 
       - name: Write X session state
@@ -67,29 +72,29 @@ jobs:
           STATE_JSON: ${{ secrets.X_STORAGE_STATE_JSON }}
         run: printf '%s' "$STATE_JSON" > x_storage_state.json
 
-      - name: Run media poster
+      - name: Run thread poster
         env:
           GDRIVE_CREDENTIALS_JSON:  ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
-          GDRIVE_SOURCE_FOLDER_ID:  ${{ github.event.inputs.source_folder_id != '' && github.event.inputs.source_folder_id || secrets.GDRIVE_SOURCE_FOLDER_ID }}
-          GDRIVE_CLAIMED_FOLDER_ID: ${{ github.event.inputs.claimed_folder_id != '' && github.event.inputs.claimed_folder_id || secrets.GDRIVE_CLAIMED_FOLDER_ID }}
-          POST_COUNT:        ${{ github.event.inputs.post_count }}
-          CAPTION_SOURCE:    ${{ github.event.inputs.caption_source }}
-          CUSTOM_CAPTION:    ${{ github.event.inputs.custom_caption }}
-          LINKS:             ${{ github.event.inputs.links }}
+          SHEET_CREDENTIALS_JSON:   ${{ secrets.SHEET_CREDENTIALS_JSON }}
+          SPREADSHEET_ID:    ${{ github.event.inputs.spreadsheet_id }}
+          SHEET_TAB_NAME:    ${{ github.event.inputs.sheet_tab_name }}
+          CAPTION_COLUMN:    ${{ github.event.inputs.caption_column }}
+          THREAD_DELIMITER:  ${{ github.event.inputs.thread_delimiter }}
+          MAX_THREADS:       ${{ github.event.inputs.max_threads }}
           INTERVAL_MINUTES:  ${{ github.event.inputs.interval_minutes }}
           SHUFFLE_ORDER:     ${{ github.event.inputs.shuffle }}
+          USE_MEDIA:         ${{ github.event.inputs.use_media }}
           IMAGE_RATIO:       ${{ github.event.inputs.image_ratio }}
+          GDRIVE_SOURCE_FOLDER_ID:  ${{ github.event.inputs.source_folder_id != '' && github.event.inputs.source_folder_id || secrets.GDRIVE_SOURCE_FOLDER_ID }}
+          GDRIVE_CLAIMED_FOLDER_ID: ${{ github.event.inputs.claimed_folder_id != '' && github.event.inputs.claimed_folder_id || secrets.GDRIVE_CLAIMED_FOLDER_ID }}
           X_STORAGE_STATE_PATH: x_storage_state.json
-          POSTS_CSV_PATH:    table.csv
-        run: python bulk_post_media_to_x.py
+        run: python post_threads_from_sheet_to_x.py
 
-      # Always upload screenshots so you can download and inspect them
-      # even when the run fails
       - name: Upload debug screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshots
+          name: debug-screenshots-threads
           path: debug_screenshots/
           if-no-files-found: ignore
           retention-days: 7
